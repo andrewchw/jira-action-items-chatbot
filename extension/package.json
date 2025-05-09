@@ -1,0 +1,28 @@
+{
+  "name": "jira-action-items-chatbot",
+  "version": "1.0.0",
+  "description": "Microsoft Edge extension with an intelligent chatbot interface for Jira action item management",
+  "main": "background.js",
+  "scripts": {
+    "build": "webpack --config webpack.config.js",
+    "watch": "webpack --watch --config webpack.config.js",
+    "dev": "webpack --watch --config webpack.config.js",
+    "test": "jest"
+  },
+  "keywords": [
+    "jira",
+    "edge",
+    "extension",
+    "chatbot",
+    "action",
+    "items"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "copy-webpack-plugin": "^11.0.0",
+    "jest": "^29.5.0",
+    "webpack": "^5.79.0",
+    "webpack-cli": "^5.0.1"
+  }
+}
