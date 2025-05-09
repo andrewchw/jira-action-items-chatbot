@@ -1,10 +1,12 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from typing import Dict
 import sys
 import os
 import subprocess
+import time
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Fix path for FastAPI compatibility issues
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.api import endpoints
 from app.core.config import settings, get_settings
 from app.services.memory import memory_service
+from app.models.database import db_manager
+from app.api.errors import register_exception_handlers
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +24,30 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Add request timing middleware
+class TimingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        
+        response = await call_next(request)
+        
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
+        
+        # Log timing information for non-static requests
+        if not request.url.path.startswith(("/static/", "/favicon.ico")):
+            logger.info(
+                f"Request timing: {request.method} {request.url.path} - {process_time:.4f}s",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "process_time": process_time,
+                    "client_host": request.client.host if request.client else None
+                }
+            )
+        
+        return response
 
 def create_application() -> FastAPI:
     """
@@ -42,6 +70,12 @@ def create_application() -> FastAPI:
         allow_headers=["*"],
     )
     
+    # Add request timing middleware
+    application.add_middleware(TimingMiddleware)
+    
+    # Register exception handlers
+    register_exception_handlers(application)
+    
     # Include API endpoints
     application.include_router(
         endpoints.router,
@@ -56,6 +90,15 @@ def create_application() -> FastAPI:
         Initialize services on startup
         """
         logger.info("Starting application...")
+        
+        # Initialize database
+        try:
+            logger.info("Initializing database...")
+            # Database is initialized when the db_manager is imported
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            logger.warning("Starting with limited database functionality")
         
         # Fall back to alternative memory implementation if MCP server is not available
         try:

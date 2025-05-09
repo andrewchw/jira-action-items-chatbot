@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # CORS Configuration
     CORS_ORIGINS: list = ["*"]  # For development; restrict this in production
     
+    # Site Information
+    SITE_URL: str = Field(default="http://localhost:8000", env="SITE_URL")
+    
     # JIRA Configuration
     JIRA_URL: Optional[str] = Field(None, env="JIRA_URL")
     JIRA_USERNAME: Optional[str] = Field(None, env="JIRA_USERNAME")
@@ -30,7 +33,11 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     OPENROUTER_API_KEY: Optional[str] = Field(None, env="OPENROUTER_API_KEY")
-    LLM_MODEL: str = Field(default="mistralai/mistral-7b-instruct", env="LLM_MODEL")
+    DEFAULT_LLM_MODEL: str = Field(default="mistralai/mistral-7b-instruct", env="DEFAULT_LLM_MODEL")
+    FALLBACK_LLM_MODEL: str = Field(default="openai/gpt-3.5-turbo", env="FALLBACK_LLM_MODEL")
+    LLM_TEMPERATURE: float = Field(default=0.7, env="LLM_TEMPERATURE")
+    LLM_MAX_TOKENS: int = Field(default=1000, env="LLM_MAX_TOKENS")
+    LLM_CACHE_TTL_HOURS: int = Field(default=24, env="LLM_CACHE_TTL_HOURS")
     
     # Database Configuration
     DATABASE_URL: str = Field(
@@ -79,7 +86,11 @@ def generate_env_template() -> Dict[str, Any]:
         
         "# LLM Configuration": "",
         "OPENROUTER_API_KEY": "your-openrouter-api-key",
-        "LLM_MODEL": "mistralai/mistral-7b-instruct",
+        "DEFAULT_LLM_MODEL": "mistralai/mistral-7b-instruct",
+        "FALLBACK_LLM_MODEL": "openai/gpt-3.5-turbo",
+        "LLM_TEMPERATURE": "0.7",
+        "LLM_MAX_TOKENS": "1000",
+        "LLM_CACHE_TTL_HOURS": "24",
         
         "# Database Configuration": "",
         "DATABASE_URL": "sqlite:///./app.db",

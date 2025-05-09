@@ -68,4 +68,50 @@ class ErrorResponse(BaseModel):
     Schema for API error responses.
     """
     detail: str = Field(..., description="Error detail message")
-    code: Optional[int] = Field(None, description="Error code") 
+    code: Optional[int] = Field(None, description="Error code")
+
+class ReminderRequest(BaseModel):
+    """
+    Schema for creating or updating a reminder.
+    """
+    task_id: str = Field(..., description="The Jira task ID to create a reminder for")
+    reminder_time: Optional[datetime] = Field(None, description="When the reminder should trigger")
+    message: Optional[str] = Field(None, description="Custom message for the reminder")
+    is_recurring: bool = Field(False, description="Whether this reminder recurs")
+    recurrence_pattern: Optional[str] = Field(None, description="Pattern for recurring reminders (e.g., 'daily', 'weekly')")
+
+class ReminderResponse(BaseModel):
+    """
+    Schema for reminder response.
+    """
+    id: Optional[int] = Field(None, description="Reminder ID")
+    task_id: str = Field(..., description="Associated Jira task ID")
+    reminder_time: datetime = Field(..., description="When the reminder will trigger")
+    message: Optional[str] = Field(None, description="Custom reminder message")
+    is_recurring: bool = Field(False, description="Whether this reminder recurs")
+    success: bool = Field(True, description="Whether the operation was successful")
+    
+    class Config:
+        orm_mode = True
+
+class ReminderDetail(BaseModel):
+    """
+    Schema for detailed reminder information.
+    """
+    id: int = Field(..., description="Reminder ID")
+    task_id: str = Field(..., description="Associated Jira task ID")
+    reminder_time: datetime = Field(..., description="When the reminder will trigger")
+    message: Optional[str] = Field(None, description="Custom reminder message")
+    is_recurring: bool = Field(False, description="Whether this reminder recurs")
+    is_sent: bool = Field(False, description="Whether this reminder has been sent")
+    recurrence_pattern: Optional[str] = Field(None, description="Pattern for recurring reminders")
+    
+    class Config:
+        orm_mode = True
+
+class ReminderList(BaseModel):
+    """
+    Schema for list of reminders.
+    """
+    reminders: List[ReminderDetail] = Field(..., description="List of reminders")
+    count: int = Field(..., description="Total count of reminders") 
