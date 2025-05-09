@@ -31,6 +31,17 @@ var taskList = document.getElementById('task-list');
 // Chat history
 var chatHistory = [];
 
+// Input suggestions based on context
+var inputSuggestions = {
+  "default": ["Create a task for me to review the documentation by Friday", "List my open tasks with high priority", "Remind me to follow up with the team tomorrow at 9 AM", "Schedule a meeting for next week", "Upload evidence for task PROJ-123"],
+  jiraIssue: ["Add a comment to this issue", "Change status to 'In Progress'", "Add me as a watcher", "Set due date to next Friday", "Assign this to John"],
+  jiraBoard: ["Show tasks assigned to me", "Create a new epic for the Q3 deliverables", "List blocked tasks in this project", "Find tasks without assignees", "Show tasks due this week"]
+};
+
+// Active context type
+var activeContextType = 'default';
+var currentJiraContext = {};
+
 // Initialize the popup
 document.addEventListener('DOMContentLoaded', function () {
   // Load settings from storage
@@ -42,6 +53,9 @@ document.addEventListener('DOMContentLoaded', function () {
   // Load chat history
   loadChatHistory();
 
+  // Get current context and update suggestions
+  updateJiraContext();
+
   // Add welcome message if this is first time
   chrome.storage.local.get('firstOpen', function (data) {
     if (data.firstOpen !== false) {
@@ -50,6 +64,14 @@ document.addEventListener('DOMContentLoaded', function () {
         firstOpen: false
       });
       addMessage('bot', 'Welcome to Jira Action Items Chatbot! How can I help you today?');
+
+      // Show sample commands
+      setTimeout(function () {
+        addMessage('bot', 'You can ask me to do things like:<br>' + '• Create tasks in Jira<br>' + '• Set reminders for due dates<br>' + '• Update task status<br>' + '• Find tasks assigned to you<br>' + '<br>Try typing a command or click a suggestion below.');
+
+        // Show initial suggestions
+        showSuggestions();
+      }, 1000);
     }
   });
 
@@ -145,6 +167,13 @@ function addMessage(sender, text) {
 
   // Add to UI
   addMessageToUI(sender, text, timestamp);
+
+  // If bot message, show suggestions after a brief delay
+  if (sender === 'bot') {
+    setTimeout(function () {
+      showSuggestions();
+    }, 500);
+  }
 }
 
 // Add message to UI
@@ -158,6 +187,61 @@ function addMessageToUI(sender, text, timestamp) {
 
   // Scroll to bottom
   chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Update Jira context and suggestions based on current tab
+function updateJiraContext() {
+  getCurrentTabInfo().then(function (tabInfo) {
+    currentJiraContext = tabInfo;
+
+    // Determine context type
+    if (tabInfo.issueKey) {
+      activeContextType = 'jiraIssue';
+      userInput.placeholder = "Ask about ".concat(tabInfo.issueKey, "...");
+    } else if (tabInfo.isJiraPage) {
+      activeContextType = 'jiraBoard';
+      userInput.placeholder = 'Ask about Jira board or project...';
+    } else {
+      activeContextType = 'default';
+      userInput.placeholder = 'Type your message here... (e.g., "Create a task for John to review docs by Monday")';
+    }
+
+    // Update suggestions
+    showSuggestions();
+  });
+}
+
+// Show context-aware suggestions
+function showSuggestions() {
+  // Remove existing suggestions
+  var existingSuggestions = document.getElementById('chat-suggestions');
+  if (existingSuggestions) {
+    existingSuggestions.remove();
+  }
+
+  // Create suggestions container
+  var suggestionsDiv = document.createElement('div');
+  suggestionsDiv.id = 'chat-suggestions';
+  suggestionsDiv.className = 'chat-suggestions';
+
+  // Get relevant suggestions
+  var suggestions = inputSuggestions[activeContextType] || inputSuggestions["default"];
+
+  // Create buttons for each suggestion
+  suggestions.slice(0, 3).forEach(function (suggestion) {
+    var button = document.createElement('button');
+    button.className = 'suggestion-button';
+    button.textContent = suggestion;
+    button.addEventListener('click', function () {
+      userInput.value = suggestion;
+      sendMessage();
+    });
+    suggestionsDiv.appendChild(button);
+  });
+
+  // Add to chat container
+  var chatContainer = document.querySelector('.chat-container');
+  chatContainer.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
 }
 
 // Set up event listeners
@@ -190,6 +274,54 @@ function setupEventListeners() {
 
   // Attachment button
   attachButton.addEventListener('click', handleAttachment);
+
+  // Focus input when chat tab is active
+  tabChat.addEventListener('click', function () {
+    setTimeout(function () {
+      return userInput.focus();
+    }, 100);
+  });
+
+  // Update context when extension is opened
+  chrome.tabs.onActivated.addListener(function () {
+    updateJiraContext();
+  });
+
+  // Input changes - smart suggestions during typing
+  userInput.addEventListener('input', smartSuggestions);
+}
+
+// Provide smart suggestions while typing
+function smartSuggestions() {
+  var input = userInput.value.toLowerCase().trim();
+
+  // Only suggest if at least 3 characters
+  if (input.length < 3) return;
+
+  // Common action words to detect
+  var createActions = ['create', 'add', 'make', 'new'];
+  var reminderActions = ['remind', 'notification', 'alert'];
+  var updateActions = ['update', 'change', 'modify', 'edit'];
+  var listActions = ['list', 'find', 'show', 'get', 'display'];
+
+  // Set placeholder based on detected intent
+  if (createActions.some(function (action) {
+    return input.includes(action);
+  }) && input.includes('task')) {
+    userInput.placeholder = 'Creating a task: Specify assignee, title, due date...';
+  } else if (reminderActions.some(function (action) {
+    return input.includes(action);
+  })) {
+    userInput.placeholder = 'Setting a reminder: Specify date, time, and details...';
+  } else if (updateActions.some(function (action) {
+    return input.includes(action);
+  }) && input.includes('status')) {
+    userInput.placeholder = 'Updating status: Specify task key and new status...';
+  } else if (listActions.some(function (action) {
+    return input.includes(action);
+  })) {
+    userInput.placeholder = 'Finding tasks: Specify criteria (assignee, status, etc.)...';
+  }
 }
 
 // Switch between tabs
@@ -231,9 +363,24 @@ function sendMessage() {
   // Clear input
   userInput.value = '';
 
+  // Reset placeholder
+  if (activeContextType === 'jiraIssue') {
+    userInput.placeholder = "Ask about ".concat(currentJiraContext.issueKey, "...");
+  } else if (activeContextType === 'jiraBoard') {
+    userInput.placeholder = 'Ask about Jira board or project...';
+  } else {
+    userInput.placeholder = 'Type your message here... (e.g., "Create a task for John to review docs by Monday")';
+  }
+
+  // Remove suggestions
+  var existingSuggestions = document.getElementById('chat-suggestions');
+  if (existingSuggestions) {
+    existingSuggestions.remove();
+  }
+
   // Get current Jira context if available
   getCurrentTabInfo().then(function (tabInfo) {
-    // Show loading indicator
+    // Show typing indicator
     addMessageToUI('bot', '<div class="typing-indicator"><span></span><span></span><span></span></div>', new Date().toISOString());
 
     // Send to server via background script
@@ -246,7 +393,7 @@ function sendMessage() {
         context: tabInfo
       }
     }, function (response) {
-      // Remove loading indicator
+      // Remove typing indicator
       chatMessages.removeChild(chatMessages.lastChild);
       if (response && response.success) {
         // Add bot response to chat
@@ -254,6 +401,9 @@ function sendMessage() {
 
         // Handle actions if any were returned
         handleActions(response.data.actions);
+
+        // Update context in case it changed
+        updateJiraContext();
       } else {
         // Show error message
         addMessage('bot', 'Sorry, I encountered an error while processing your request. Please try again later.');

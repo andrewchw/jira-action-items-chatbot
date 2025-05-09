@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="8" cy="8" r="7.5" fill="#0052CC" />
+  
+  <!-- Chat bubble -->
+  <path d="M12 5H4C3.44772 5 3 5.44772 3 6V11C3 11.5523 3.44772 12 4 12H6L8 14L10 12H12C12.5523 12 13 11.5523 13 11V6C13 5.44772 12.5523 5 12 5Z" fill="white"/>
+  
+  <!-- Action items simplified for 16px -->
+  <rect x="5" y="7" width="3" height="0.8" rx="0.4" fill="#0052CC"/>
+  <rect x="5" y="9" width="5" height="0.8" rx="0.4" fill="#0052CC"/>
+  
+  <circle cx="10" cy="7" r="1.2" fill="#36B37E"/>
+</svg> 

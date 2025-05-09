@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="24" cy="24" r="22" fill="#0052CC" />
+  
+  <!-- Chat bubble -->
+  <path d="M35 17H13C11.8954 17 11 17.8954 11 19V32C11 33.1046 11.8954 34 13 34H19L24 39L29 34H35C36.1046 34 37 33.1046 37 32V19C37 17.8954 36.1046 17 35 17Z" fill="white"/>
+  
+  <!-- Action items: checkmark, lines -->
+  <rect x="16" y="22" width="10" height="1.5" rx="0.75" fill="#0052CC"/>
+  <rect x="16" y="26" width="16" height="1.5" rx="0.75" fill="#0052CC"/>
+  <rect x="16" y="30" width="13" height="1.5" rx="0.75" fill="#0052CC"/>
+  
+  <circle cx="29" cy="22" r="3" fill="#36B37E"/>
+  <path d="M28 22L29 23L31 21" stroke="white" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+</svg> 

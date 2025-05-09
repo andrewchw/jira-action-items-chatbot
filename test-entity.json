@@ -1,0 +1,11 @@
+{
+  "entities": [
+    {
+      "name": "test_entity",
+      "entityType": "test",
+      "observations": [
+        "This is a test entity"
+      ]
+    }
+  ]
+}

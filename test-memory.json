@@ -1,0 +1,12 @@
+{
+  "name": "mcp_memory_create_entities",
+  "arguments": {
+    "entities": [
+      {
+        "name": "test_user",
+        "entityType": "person",
+        "observations": ["This is a test user"]
+      }
+    ]
+  }
+} 
