@@ -14,7 +14,7 @@ A Microsoft Edge extension with an intelligent chatbot interface that enables te
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/jira-action-items-chatbot.git
+git clone https://github.com/deencat/jira-action-items-chatbot.git
 cd jira-action-items-chatbot
 ```
 
