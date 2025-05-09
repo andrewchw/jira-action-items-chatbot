@@ -106,6 +106,7 @@ Tasks are ordered chronologically from top to bottom:
 - Project documentation structure setup
 - Taskmaster project initialization
 - Task #1.1: Set up Node.js environment and Edge extension structure
+- Root package.json and publishing setup
 
 ### 4.5 In-Progress Tasks
 
@@ -377,6 +378,63 @@ This Project Management Plan is a living document that will be:
 - Software Requirements Specification
 - User Interface Design Document
 - Taskmaster Development Workflow Guide
+
+## 8. Deployment & Publishing Plan
+
+### 8.1 Extension Packaging Process
+
+1. **Prepare for Deployment:**
+   - Update version numbers in manifest.json and package.json
+   - Run `npm run build` to create production build
+   - Run `npm run pack:extension` to create distribution ZIP file
+
+2. **Quality Checks:**
+   - Run all tests with `npm test`
+   - Validate manifest entries match Microsoft Edge requirements
+   - Check that all permissions are properly declared
+   - Verify icons are present in required sizes
+
+3. **Edge Add-ons Store Submission:**
+   - Create developer account on [Edge Add-ons Developer Dashboard](https://partner.microsoft.com/en-us/dashboard/microsoftedge/overview)
+   - Submit extension package with required metadata
+     - Title: Jira Action Items Chatbot
+     - Description: Extended version of description from package.json
+     - Privacy policy URL
+     - Support URL
+     - Screenshots of key features
+     - Promo images
+   - Submit for review
+   - Address any feedback from Microsoft review team
+
+4. **Post-Publication:**
+   - Monitor usage statistics through dashboard
+   - Collect user feedback for future improvements
+   - Plan update schedule for feature enhancements
+
+### 8.2 Server Deployment
+
+1. **Server Requirements:**
+   - Python 3.10+ environment
+   - Port 8000 open on internal network
+   - Access to Jira API from deployment server
+   - Environment variables configured
+
+2. **Deployment Options:**
+   - On-premises deployment for high-security environments
+   - Docker-based deployment for easier scaling
+   - Cloud deployment for testing and public access
+
+3. **Configuration:**
+   - URL configuration in extension settings
+   - Firewall access rules
+   - API rate limiting and security measures
+
+### 8.3 Maintenance Plan
+
+- Regular updates to address security vulnerabilities
+- Compatibility testing with Edge browser updates
+- Performance monitoring and optimization
+- Documentation updates with each new feature
 
 ---
 

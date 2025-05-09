@@ -1,0 +1,37 @@
+{
+  "name": "jira-action-items-chatbot",
+  "version": "1.0.0",
+  "description": "Microsoft Edge extension with an intelligent chatbot interface for Jira action item management",
+  "main": "index.js",
+  "scripts": {
+    "extension:build": "cd extension && npm run build",
+    "extension:dev": "cd extension && npm run dev",
+    "extension:test": "cd extension && npm run test",
+    "install:all": "npm install && cd extension && npm install",
+    "build": "npm run extension:build",
+    "dev": "npm run extension:dev",
+    "test": "npm run extension:test",
+    "pack:extension": "npm run build && cd extension/dist && powershell Compress-Archive -Path * -DestinationPath ../../jira-action-items-chatbot.zip -Force"
+  },
+  "keywords": [
+    "jira",
+    "edge",
+    "extension",
+    "chatbot",
+    "action",
+    "items",
+    "microsoft"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/jira-action-items-chatbot.git"
+  },
+  "devDependencies": {
+    "concurrently": "^8.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+} 
