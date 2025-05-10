@@ -14,6 +14,9 @@ function _asyncToGenerator(n) { return function () { var t = this, e = arguments
 // Server connection settings
 var API_BASE_URL = 'http://localhost:8000';
 
+// Auth state for storing CSRF protection
+var authState = null;
+
 // Listen for installation
 chrome.runtime.onInstalled.addListener(function () {
   console.log('Jira Action Items Chatbot extension installed');
@@ -22,7 +25,8 @@ chrome.runtime.onInstalled.addListener(function () {
   chrome.storage.local.set({
     serverUrl: API_BASE_URL,
     notificationsEnabled: true,
-    lastSyncTime: null
+    lastSyncTime: null,
+    isAuthenticated: false
   });
 });
 
@@ -46,6 +50,48 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     showNotification(message.title, message.message, message.actions);
     sendResponse({
       success: true
+    });
+    return true;
+  }
+  if (message.type === 'AUTH_LOGIN') {
+    initiateLogin().then(function (result) {
+      return sendResponse({
+        success: true,
+        data: result
+      });
+    })["catch"](function (error) {
+      return sendResponse({
+        success: false,
+        error: error.message
+      });
+    });
+    return true;
+  }
+  if (message.type === 'AUTH_LOGOUT') {
+    logout().then(function (result) {
+      return sendResponse({
+        success: true,
+        data: result
+      });
+    })["catch"](function (error) {
+      return sendResponse({
+        success: false,
+        error: error.message
+      });
+    });
+    return true;
+  }
+  if (message.type === 'AUTH_STATUS') {
+    checkAuthStatus().then(function (status) {
+      return sendResponse({
+        success: true,
+        data: status
+      });
+    })["catch"](function (error) {
+      return sendResponse({
+        success: false,
+        error: error.message
+      });
     });
     return true;
   }
@@ -86,6 +132,7 @@ function _handleApiRequest() {
       url,
       options,
       response,
+      isRefreshed,
       _args2 = arguments;
     return _regeneratorRuntime().wrap(function _callee2$(_context2) {
       while (1) switch (_context2.prev = _context2.next) {
@@ -101,7 +148,8 @@ function _handleApiRequest() {
             method: method,
             headers: {
               'Content-Type': 'application/json'
-            }
+            },
+            credentials: 'include' // Include cookies for cross-origin requests
           };
           if (data && (method === 'POST' || method === 'PUT')) {
             options.body = JSON.stringify(data);
@@ -112,25 +160,39 @@ function _handleApiRequest() {
         case 11:
           response = _context2.sent;
           if (response.ok) {
-            _context2.next = 14;
+            _context2.next = 20;
             break;
           }
-          throw new Error("Server responded with ".concat(response.status, ": ").concat(response.statusText));
-        case 14:
+          if (!(response.status === 401)) {
+            _context2.next = 19;
+            break;
+          }
           _context2.next = 16;
-          return response.json();
+          return refreshAuth();
         case 16:
-          return _context2.abrupt("return", _context2.sent);
+          isRefreshed = _context2.sent;
+          if (!isRefreshed) {
+            _context2.next = 19;
+            break;
+          }
+          return _context2.abrupt("return", handleApiRequest(endpoint, method, data));
         case 19:
-          _context2.prev = 19;
+          throw new Error("Server responded with ".concat(response.status, ": ").concat(response.statusText));
+        case 20:
+          _context2.next = 22;
+          return response.json();
+        case 22:
+          return _context2.abrupt("return", _context2.sent);
+        case 25:
+          _context2.prev = 25;
           _context2.t0 = _context2["catch"](8);
           console.error('API request failed:', _context2.t0);
           throw _context2.t0;
-        case 23:
+        case 29:
         case "end":
           return _context2.stop();
       }
-    }, _callee2, null, [[8, 19]]);
+    }, _callee2, null, [[8, 25]]);
   }));
   return _handleApiRequest.apply(this, arguments);
 }
@@ -156,32 +218,235 @@ function _getServerUrl() {
   return _getServerUrl.apply(this, arguments);
 }
 setInterval(/*#__PURE__*/_asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee() {
-  var data;
+  var authStatus, data;
   return _regeneratorRuntime().wrap(function _callee$(_context) {
     while (1) switch (_context.prev = _context.next) {
       case 0:
         _context.prev = 0;
         _context.next = 3;
-        return handleApiRequest('/reminders/check');
+        return checkAuthStatus();
       case 3:
+        authStatus = _context.sent;
+        if (authStatus.authenticated) {
+          _context.next = 7;
+          break;
+        }
+        console.log('Not authenticated, skipping reminder check');
+        return _context.abrupt("return");
+      case 7:
+        _context.next = 9;
+        return handleApiRequest('/reminders/check');
+      case 9:
         data = _context.sent;
         if (data.reminders && data.reminders.length > 0) {
           data.reminders.forEach(function (reminder) {
             showNotification('Jira Reminder', reminder.message, ['Done', 'Snooze', 'View Details']);
           });
         }
-        _context.next = 10;
+        _context.next = 16;
         break;
-      case 7:
-        _context.prev = 7;
+      case 13:
+        _context.prev = 13;
         _context.t0 = _context["catch"](0);
         console.error('Failed to check reminders:', _context.t0);
-      case 10:
+      case 16:
       case "end":
         return _context.stop();
     }
-  }, _callee, null, [[0, 7]]);
+  }, _callee, null, [[0, 13]]);
 })), 300000); // Check every 5 minutes
+
+// OAuth Authentication
+
+// Initiate the OAuth login process
+function initiateLogin() {
+  return _initiateLogin.apply(this, arguments);
+} // Logout the user
+function _initiateLogin() {
+  _initiateLogin = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee4() {
+    var serverUrl, loginUrl;
+    return _regeneratorRuntime().wrap(function _callee4$(_context4) {
+      while (1) switch (_context4.prev = _context4.next) {
+        case 0:
+          _context4.prev = 0;
+          // Generate a random state to protect against CSRF
+          authState = Math.random().toString(36).substring(2, 15);
+
+          // Save state to storage for validation later
+          chrome.storage.local.set({
+            'oauth_state': authState
+          });
+          _context4.next = 5;
+          return getServerUrl();
+        case 5:
+          serverUrl = _context4.sent;
+          loginUrl = "".concat(serverUrl, "/api/auth/login"); // Open a new tab with the login URL
+          chrome.tabs.create({
+            url: loginUrl
+          });
+          return _context4.abrupt("return", {
+            message: 'Login initiated'
+          });
+        case 11:
+          _context4.prev = 11;
+          _context4.t0 = _context4["catch"](0);
+          console.error('Failed to initiate login:', _context4.t0);
+          throw _context4.t0;
+        case 15:
+        case "end":
+          return _context4.stop();
+      }
+    }, _callee4, null, [[0, 11]]);
+  }));
+  return _initiateLogin.apply(this, arguments);
+}
+function logout() {
+  return _logout.apply(this, arguments);
+} // Check if the user is authenticated
+function _logout() {
+  _logout = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee5() {
+    var serverUrl, logoutUrl;
+    return _regeneratorRuntime().wrap(function _callee5$(_context5) {
+      while (1) switch (_context5.prev = _context5.next) {
+        case 0:
+          _context5.prev = 0;
+          _context5.next = 3;
+          return getServerUrl();
+        case 3:
+          serverUrl = _context5.sent;
+          logoutUrl = "".concat(serverUrl, "/api/auth/logout"); // Call the logout API
+          _context5.next = 7;
+          return fetch(logoutUrl, {
+            method: 'GET',
+            credentials: 'include' // Include cookies
+          });
+        case 7:
+          // Update local storage auth status
+          chrome.storage.local.set({
+            isAuthenticated: false
+          });
+          return _context5.abrupt("return", {
+            message: 'Logged out successfully'
+          });
+        case 11:
+          _context5.prev = 11;
+          _context5.t0 = _context5["catch"](0);
+          console.error('Failed to logout:', _context5.t0);
+          throw _context5.t0;
+        case 15:
+        case "end":
+          return _context5.stop();
+      }
+    }, _callee5, null, [[0, 11]]);
+  }));
+  return _logout.apply(this, arguments);
+}
+function checkAuthStatus() {
+  return _checkAuthStatus.apply(this, arguments);
+} // Refresh the auth token
+function _checkAuthStatus() {
+  _checkAuthStatus = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee6() {
+    var serverUrl, statusUrl, response, status;
+    return _regeneratorRuntime().wrap(function _callee6$(_context6) {
+      while (1) switch (_context6.prev = _context6.next) {
+        case 0:
+          _context6.prev = 0;
+          _context6.next = 3;
+          return getServerUrl();
+        case 3:
+          serverUrl = _context6.sent;
+          statusUrl = "".concat(serverUrl, "/api/auth/status"); // Call the status API
+          _context6.next = 7;
+          return fetch(statusUrl, {
+            method: 'GET',
+            credentials: 'include' // Include cookies
+          });
+        case 7:
+          response = _context6.sent;
+          if (response.ok) {
+            _context6.next = 10;
+            break;
+          }
+          throw new Error("Server responded with ".concat(response.status, ": ").concat(response.statusText));
+        case 10:
+          _context6.next = 12;
+          return response.json();
+        case 12:
+          status = _context6.sent;
+          // Update local storage auth status
+          chrome.storage.local.set({
+            isAuthenticated: status.authenticated
+          });
+          return _context6.abrupt("return", status);
+        case 17:
+          _context6.prev = 17;
+          _context6.t0 = _context6["catch"](0);
+          console.error('Failed to check auth status:', _context6.t0);
+          // In case of error, assume not authenticated
+          chrome.storage.local.set({
+            isAuthenticated: false
+          });
+          return _context6.abrupt("return", {
+            authenticated: false,
+            error: _context6.t0.message
+          });
+        case 22:
+        case "end":
+          return _context6.stop();
+      }
+    }, _callee6, null, [[0, 17]]);
+  }));
+  return _checkAuthStatus.apply(this, arguments);
+}
+function refreshAuth() {
+  return _refreshAuth.apply(this, arguments);
+} // Check auth status when extension loads
+function _refreshAuth() {
+  _refreshAuth = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee7() {
+    var serverUrl, refreshUrl, response, result;
+    return _regeneratorRuntime().wrap(function _callee7$(_context7) {
+      while (1) switch (_context7.prev = _context7.next) {
+        case 0:
+          _context7.prev = 0;
+          _context7.next = 3;
+          return getServerUrl();
+        case 3:
+          serverUrl = _context7.sent;
+          refreshUrl = "".concat(serverUrl, "/api/auth/refresh-token"); // Call the refresh token API
+          _context7.next = 7;
+          return fetch(refreshUrl, {
+            method: 'POST',
+            credentials: 'include' // Include cookies
+          });
+        case 7:
+          response = _context7.sent;
+          if (response.ok) {
+            _context7.next = 10;
+            break;
+          }
+          throw new Error("Server responded with ".concat(response.status, ": ").concat(response.statusText));
+        case 10:
+          _context7.next = 12;
+          return response.json();
+        case 12:
+          result = _context7.sent;
+          return _context7.abrupt("return", result.success);
+        case 16:
+          _context7.prev = 16;
+          _context7.t0 = _context7["catch"](0);
+          console.error('Failed to refresh auth token:', _context7.t0);
+          return _context7.abrupt("return", false);
+        case 20:
+        case "end":
+          return _context7.stop();
+      }
+    }, _callee7, null, [[0, 16]]);
+  }));
+  return _refreshAuth.apply(this, arguments);
+}
+checkAuthStatus().then(function (status) {
+  console.log('Initial auth status:', status.authenticated ? 'Authenticated' : 'Not authenticated');
+});
 /******/ })()
 ;
 //# sourceMappingURL=background.js.map

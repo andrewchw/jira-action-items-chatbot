@@ -23,6 +23,10 @@ const taskList = document.getElementById('task-list');
 // Chat history
 let chatHistory = [];
 
+// Auth state
+let isAuthenticated = false;
+let currentUser = null;
+
 // Input suggestions based on context
 const inputSuggestions = {
   default: [
@@ -60,6 +64,9 @@ document.addEventListener('DOMContentLoaded', () => {
   // Check server connection
   checkServerConnection();
   
+  // Check authentication status
+  checkAuthStatus();
+  
   // Load chat history
   loadChatHistory();
   
@@ -94,13 +101,111 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Load settings from storage
 function loadSettings() {
-  chrome.storage.local.get(['serverUrl', 'notificationsEnabled'], (data) => {
+  chrome.storage.local.get(['serverUrl', 'notificationsEnabled', 'isAuthenticated'], (data) => {
     if (data.serverUrl) {
       serverUrlInput.value = data.serverUrl;
     }
     
     if (data.notificationsEnabled !== undefined) {
       notificationsToggle.checked = data.notificationsEnabled;
+    }
+    
+    isAuthenticated = data.isAuthenticated || false;
+  });
+}
+
+// Check authentication status
+function checkAuthStatus() {
+  chrome.runtime.sendMessage({ type: 'AUTH_STATUS' }, (response) => {
+    if (response.success) {
+      isAuthenticated = response.data.authenticated;
+      currentUser = response.data.user;
+      updateAuthUI();
+    } else {
+      console.error('Failed to check authentication status:', response.error);
+      isAuthenticated = false;
+      updateAuthUI();
+    }
+  });
+}
+
+// Update UI based on authentication status
+function updateAuthUI() {
+  // Add Auth UI to settings tab if it doesn't exist
+  if (!document.getElementById('auth-settings')) {
+    const authGroup = document.createElement('div');
+    authGroup.id = 'auth-settings';
+    authGroup.className = 'settings-group auth-settings';
+    authGroup.innerHTML = `
+      <label>Authentication</label>
+      <div id="auth-status" class="auth-status"></div>
+      <div id="auth-buttons" class="auth-buttons"></div>
+    `;
+    
+    // Insert before save button
+    const saveGroup = document.querySelector('.settings-group:last-child');
+    settingsContent.insertBefore(authGroup, saveGroup);
+  }
+  
+  // Update auth status display
+  const authStatus = document.getElementById('auth-status');
+  const authButtons = document.getElementById('auth-buttons');
+  
+  if (isAuthenticated && currentUser) {
+    authStatus.innerHTML = `
+      <div class="user-info">
+        <span class="status-circle connected"></span>
+        <span>Logged in as: <strong>${currentUser.name || currentUser.email || currentUser.account_id}</strong></span>
+      </div>
+    `;
+    
+    authButtons.innerHTML = `
+      <button id="logout-button" class="secondary-button">Log Out</button>
+    `;
+    
+    // Add logout event listener
+    document.getElementById('logout-button').addEventListener('click', handleLogout);
+  } else {
+    authStatus.innerHTML = `
+      <div class="user-info">
+        <span class="status-circle disconnected"></span>
+        <span>Not logged in</span>
+      </div>
+    `;
+    
+    authButtons.innerHTML = `
+      <button id="login-button" class="primary-button">Log In with Jira</button>
+    `;
+    
+    // Add login event listener
+    document.getElementById('login-button').addEventListener('click', handleLogin);
+  }
+}
+
+// Handle login button click
+function handleLogin() {
+  chrome.runtime.sendMessage({ type: 'AUTH_LOGIN' }, (response) => {
+    if (!response.success) {
+      console.error('Failed to initiate login:', response.error);
+      // Show error in UI
+      addMessage('bot', 'Failed to log in. Please try again later.');
+    }
+  });
+}
+
+// Handle logout button click
+function handleLogout() {
+  chrome.runtime.sendMessage({ type: 'AUTH_LOGOUT' }, (response) => {
+    if (response.success) {
+      isAuthenticated = false;
+      currentUser = null;
+      updateAuthUI();
+      // Show logout message
+      addMessage('bot', 'You have been logged out successfully.');
+    } else {
+      console.error('Failed to logout:', response.error);
+      // Show error in UI
+      addMessage('bot', 'Failed to log out. Please try again later.');
     }
   });
 }
@@ -235,10 +340,23 @@ function showSuggestions() {
     existingSuggestions.remove();
   }
   
-  // Create suggestions container
-  const suggestionsDiv = document.createElement('div');
-  suggestionsDiv.id = 'chat-suggestions';
-  suggestionsDiv.className = 'chat-suggestions';
+  // If not authenticated and not in settings tab, show login suggestion
+  if (!isAuthenticated && !document.getElementById('tab-settings').classList.contains('active')) {
+    const loginButton = document.createElement('button');
+    loginButton.className = 'suggestion-button login-suggestion';
+    loginButton.textContent = 'Log in with Jira to get started';
+    loginButton.onclick = () => {
+      switchTab(tabSettings);
+      setTimeout(() => {
+        const loginBtn = document.getElementById('login-button');
+        if (loginBtn) loginBtn.focus();
+      }, 100);
+    };
+    
+    suggestionsDiv.appendChild(loginButton);
+    chatMessages.parentNode.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+    return;
+  }
   
   // Get relevant suggestions
   const suggestions = inputSuggestions[activeContextType] || inputSuggestions.default;
@@ -248,24 +366,26 @@ function showSuggestions() {
     const button = document.createElement('button');
     button.className = 'suggestion-button';
     button.textContent = suggestion;
-    button.addEventListener('click', () => {
+    button.onclick = () => {
       userInput.value = suggestion;
       sendMessage();
-    });
+    };
+    
     suggestionsDiv.appendChild(button);
   });
   
-  // Add to chat container
-  const chatContainer = document.querySelector('.chat-container');
-  chatContainer.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+  // Append suggestions to UI
+  if (suggestions.length > 0) {
+    chatMessages.parentNode.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+  }
 }
 
 // Set up event listeners
 function setupEventListeners() {
-  // Send message when button clicked
+  // Send button
   sendButton.addEventListener('click', sendMessage);
   
-  // Send message when Enter pressed (but allow Shift+Enter for new lines)
+  // User input
   userInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -273,106 +393,98 @@ function setupEventListeners() {
     }
   });
   
-  // Tab switching
-  tabChat.addEventListener('click', () => switchTab('chat'));
-  tabTasks.addEventListener('click', () => {
-    switchTab('tasks');
-    loadTasks();
-  });
-  tabSettings.addEventListener('click', () => switchTab('settings'));
+  // User input for suggestions
+  userInput.addEventListener('input', smartSuggestions);
   
-  // Save settings
-  saveSettingsButton.addEventListener('click', saveSettings);
-  
-  // Attachment button
+  // Attach button
   attachButton.addEventListener('click', handleAttachment);
   
-  // Focus input when chat tab is active
-  tabChat.addEventListener('click', () => {
-    setTimeout(() => userInput.focus(), 100);
-  });
+  // Tab buttons
+  tabChat.addEventListener('click', () => switchTab(tabChat));
+  tabTasks.addEventListener('click', () => switchTab(tabTasks));
+  tabSettings.addEventListener('click', () => switchTab(tabSettings));
   
-  // Update context when extension is opened
-  chrome.tabs.onActivated.addListener(() => {
-    updateJiraContext();
-  });
-  
-  // Input changes - smart suggestions during typing
-  userInput.addEventListener('input', smartSuggestions);
+  // Save settings button
+  saveSettingsButton.addEventListener('click', saveSettings);
 }
 
-// Provide smart suggestions while typing
+// Show smarter suggestions based on partial typing
 function smartSuggestions() {
-  const input = userInput.value.toLowerCase().trim();
-  
-  // Only suggest if at least 3 characters
+  const input = userInput.value.toLowerCase();
   if (input.length < 3) return;
   
-  // Common action words to detect
-  const createActions = ['create', 'add', 'make', 'new'];
-  const reminderActions = ['remind', 'notification', 'alert'];
-  const updateActions = ['update', 'change', 'modify', 'edit'];
-  const listActions = ['list', 'find', 'show', 'get', 'display'];
+  // Get relevant suggestions
+  const suggestions = inputSuggestions[activeContextType] || inputSuggestions.default;
   
-  // Set placeholder based on detected intent
-  if (createActions.some(action => input.includes(action)) && input.includes('task')) {
-    userInput.placeholder = 'Creating a task: Specify assignee, title, due date...';
-  } else if (reminderActions.some(action => input.includes(action))) {
-    userInput.placeholder = 'Setting a reminder: Specify date, time, and details...';
-  } else if (updateActions.some(action => input.includes(action)) && input.includes('status')) {
-    userInput.placeholder = 'Updating status: Specify task key and new status...';
-  } else if (listActions.some(action => input.includes(action))) {
-    userInput.placeholder = 'Finding tasks: Specify criteria (assignee, status, etc.)...';
+  // Filter suggestions that partially match input
+  const matchingSuggestions = suggestions.filter(
+    suggestion => suggestion.toLowerCase().includes(input)
+  );
+  
+  // Show up to 3 matching suggestions
+  if (matchingSuggestions.length > 0) {
+    // Remove existing suggestions
+    const existingSuggestions = document.getElementById('chat-suggestions');
+    if (existingSuggestions) {
+      existingSuggestions.remove();
+    }
+    
+    // Create suggestions container
+    const suggestionsDiv = document.createElement('div');
+    suggestionsDiv.id = 'chat-suggestions';
+    suggestionsDiv.className = 'chat-suggestions';
+    
+    // Create buttons for each suggestion
+    matchingSuggestions.slice(0, 3).forEach(suggestion => {
+      const button = document.createElement('button');
+      button.className = 'suggestion-button';
+      button.textContent = suggestion;
+      button.onclick = () => {
+        userInput.value = suggestion;
+        sendMessage();
+      };
+      
+      suggestionsDiv.appendChild(button);
+    });
+    
+    // Append suggestions to UI
+    chatMessages.parentNode.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
   }
 }
 
 // Switch between tabs
 function switchTab(tab) {
-  // Hide all tabs
-  document.querySelector('.chat-container').style.display = 'none';
+  // Remove active class from all tabs
+  [tabChat, tabTasks, tabSettings].forEach(t => t.classList.remove('active'));
+  
+  // Add active class to selected tab
+  tab.classList.add('active');
+  
+  // Hide all content
+  chatMessages.parentNode.style.display = 'none';
   tasksContent.style.display = 'none';
   settingsContent.style.display = 'none';
   
-  // Remove active class from all tab buttons
-  tabChat.classList.remove('active');
-  tabTasks.classList.remove('active');
-  tabSettings.classList.remove('active');
-  
-  // Show selected tab
-  switch (tab) {
-    case 'tasks':
-      tasksContent.style.display = 'block';
-      tabTasks.classList.add('active');
-      break;
-    case 'settings':
-      settingsContent.style.display = 'block';
-      tabSettings.classList.add('active');
-      break;
-    default:
-      document.querySelector('.chat-container').style.display = 'block';
-      tabChat.classList.add('active');
+  // Show content based on selected tab
+  if (tab === tabChat) {
+    chatMessages.parentNode.style.display = 'flex';
+    showSuggestions();
+  } else if (tab === tabTasks) {
+    tasksContent.style.display = 'block';
+    loadTasks();
+  } else if (tab === tabSettings) {
+    settingsContent.style.display = 'block';
+    updateAuthUI();
   }
 }
 
-// Send message to the server and process response
-function sendMessage() {
+// Send message to API
+async function sendMessage() {
   const message = userInput.value.trim();
   if (!message) return;
   
-  // Add user message to UI
-  addMessage('user', message);
-  
   // Clear input
   userInput.value = '';
-  
-  // Reset placeholder
-  if (activeContextType === 'jiraIssue') {
-    userInput.placeholder = `Ask about ${currentJiraContext.issueKey}...`;
-  } else if (activeContextType === 'jiraBoard') {
-    userInput.placeholder = 'Ask about Jira board or project...';
-  } else {
-    userInput.placeholder = 'Type your message here... (e.g., "Create a task for John to review docs by Monday")';
-  }
   
   // Remove suggestions
   const existingSuggestions = document.getElementById('chat-suggestions');
@@ -380,124 +492,185 @@ function sendMessage() {
     existingSuggestions.remove();
   }
   
-  // Get current Jira context if available
-  getCurrentTabInfo()
-    .then(tabInfo => {
-      // Show typing indicator
-      addMessageToUI('bot', '<div class="typing-indicator"><span></span><span></span><span></span></div>', new Date().toISOString());
+  // Add user message to UI
+  addMessage('user', message);
+  
+  // Add typing indicator
+  const typingIndicator = document.createElement('div');
+  typingIndicator.className = 'message bot-message typing-indicator';
+  typingIndicator.innerHTML = '<div class="dots"><span>.</span><span>.</span><span>.</span></div>';
+  chatMessages.appendChild(typingIndicator);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  
+  // Check if authenticated
+  if (!isAuthenticated) {
+    // Remove typing indicator
+    typingIndicator.remove();
+    
+    // Add response about authentication
+    addMessage('bot', 'Please log in with Jira to use the chatbot. Go to the Settings tab to log in.');
+    return;
+  }
+  
+  try {
+    // Prepare message with context
+    const messageData = {
+      text: message,
+      context: currentJiraContext
+    };
+    
+    // Send to API
+    chrome.runtime.sendMessage({
+      type: 'API_REQUEST',
+      endpoint: '/api/chat',
+      method: 'POST',
+      data: messageData
+    }, (response) => {
+      // Remove typing indicator
+      typingIndicator.remove();
       
-      // Send to server via background script
-      chrome.runtime.sendMessage({
-        type: 'API_REQUEST',
-        endpoint: '/chat',
-        method: 'POST',
-        data: {
-          message,
-          context: tabInfo
-        }
-      }, response => {
-        // Remove typing indicator
-        chatMessages.removeChild(chatMessages.lastChild);
+      if (response.success) {
+        // Add bot response to UI
+        addMessage('bot', response.data.response);
         
-        if (response && response.success) {
-          // Add bot response to chat
-          addMessage('bot', response.data.response);
-          
-          // Handle actions if any were returned
+        // Handle actions if any
+        if (response.data.actions) {
           handleActions(response.data.actions);
-          
-          // Update context in case it changed
-          updateJiraContext();
-        } else {
-          // Show error message
-          addMessage('bot', 'Sorry, I encountered an error while processing your request. Please try again later.');
         }
-      });
+      } else {
+        // Add error message to UI
+        addMessage('bot', `Sorry, I couldn't process your request. ${response.error}`);
+        
+        // If unauthorized, update auth status
+        if (response.error.includes('401') || response.error.includes('unauthorized')) {
+          checkAuthStatus();
+        }
+      }
     });
+  } catch (error) {
+    // Remove typing indicator
+    typingIndicator.remove();
+    
+    // Add error message to UI
+    addMessage('bot', `Sorry, something went wrong. ${error.message}`);
+    console.error('Error sending message:', error);
+  }
 }
 
-// Get info about the current tab for context
+// Get info about current tab
 async function getCurrentTabInfo() {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs.length === 0) {
-        resolve({});
+        resolve({ isJiraPage: false });
         return;
       }
       
-      const currentTab = tabs[0];
+      const url = tabs[0].url;
+      const title = tabs[0].title;
       
-      // If it's a Jira page, try to get additional context
-      if (currentTab.url.includes('atlassian.net') || currentTab.url.includes('jira')) {
-        chrome.tabs.sendMessage(currentTab.id, { type: 'GET_JIRA_CONTEXT' }, response => {
-          if (chrome.runtime.lastError || !response) {
-            // If content script not available or no response
-            resolve({
-              url: currentTab.url,
-              title: currentTab.title
-            });
-          } else {
-            resolve(response);
-          }
-        });
-      } else {
-        // Not a Jira page
-        resolve({
-          url: currentTab.url,
-          title: currentTab.title
-        });
-      }
+      // Check if this is a Jira page
+      const isJiraPage = url.includes('atlassian.net') || url.includes('jira');
+      
+      // Extract issue key if present in URL or title
+      const issueKeyRegex = /\b([A-Z]+-[0-9]+)\b/;
+      const urlMatch = url.match(issueKeyRegex);
+      const titleMatch = title.match(issueKeyRegex);
+      const issueKey = urlMatch ? urlMatch[1] : (titleMatch ? titleMatch[1] : null);
+      
+      // Extract project key if found
+      const projectKeyRegex = /projects\/([A-Z]+)/;
+      const projectMatch = url.match(projectKeyRegex);
+      const projectKey = projectMatch ? projectMatch[1] : null;
+      
+      resolve({
+        isJiraPage,
+        issueKey,
+        projectKey,
+        url,
+        title
+      });
     });
   });
 }
 
-// Handle any actions returned from the server
+// Handle suggested actions
 function handleActions(actions) {
-  if (!actions || actions.length === 0) return;
+  // Remove existing actions
+  const existingActions = document.getElementById('suggested-actions');
+  if (existingActions) {
+    existingActions.remove();
+  }
   
+  // Create actions container
+  const actionsDiv = document.createElement('div');
+  actionsDiv.id = 'suggested-actions';
+  actionsDiv.className = 'suggested-actions';
+  
+  // Add heading
+  const heading = document.createElement('div');
+  heading.className = 'actions-heading';
+  heading.textContent = 'Suggested Actions:';
+  actionsDiv.appendChild(heading);
+  
+  // Create buttons for each action
   actions.forEach(action => {
-    switch (action.type) {
-      case 'open_url':
-        chrome.tabs.create({ url: action.data.url });
-        break;
-      case 'show_notification':
-        chrome.runtime.sendMessage({
-          type: 'SHOW_NOTIFICATION',
-          title: action.data.title,
-          message: action.data.message,
-          actions: action.data.actions
-        });
-        break;
-      case 'refresh_tasks':
-        if (tabTasks.classList.contains('active')) {
-          loadTasks();
-        }
-        break;
+    const button = document.createElement('button');
+    button.className = 'action-button';
+    button.textContent = action.text;
+    
+    if (action.url) {
+      // Open URL action
+      button.onclick = () => {
+        chrome.tabs.create({ url: action.url });
+      };
+    } else if (action.action) {
+      // Custom action
+      button.onclick = () => {
+        // Handle different action types
+        // ...
+      };
     }
+    
+    actionsDiv.appendChild(button);
   });
+  
+  // Append actions to UI
+  chatMessages.appendChild(actionsDiv);
+  
+  // Scroll to bottom
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-// Load tasks from server
+// Load tasks from API
 function loadTasks() {
+  // Show loading indicator
   taskList.innerHTML = '<div class="loading-indicator">Loading tasks...</div>';
   
+  // Check if authenticated
+  if (!isAuthenticated) {
+    taskList.innerHTML = '<div class="no-tasks">Please log in with Jira to see your tasks.</div>';
+    return;
+  }
+  
+  // Fetch tasks
   chrome.runtime.sendMessage({
     type: 'API_REQUEST',
-    endpoint: '/tasks',
+    endpoint: '/api/jira/tasks',
     method: 'GET'
-  }, response => {
-    if (response && response.success) {
-      displayTasks(response.data.tasks);
+  }, (response) => {
+    if (response.success) {
+      displayTasks(response.data.issues || []);
     } else {
-      taskList.innerHTML = '<div class="error-message">Failed to load tasks. Please try again later.</div>';
+      taskList.innerHTML = `<div class="error-message">Failed to load tasks: ${response.error}</div>`;
     }
   });
 }
 
 // Display tasks in the UI
 function displayTasks(tasks) {
-  if (!tasks || tasks.length === 0) {
-    taskList.innerHTML = '<div class="empty-message">No tasks found.</div>';
+  if (tasks.length === 0) {
+    taskList.innerHTML = '<div class="no-tasks">No tasks found.</div>';
     return;
   }
   
@@ -505,25 +678,55 @@ function displayTasks(tasks) {
   
   tasks.forEach(task => {
     const taskElement = document.createElement('div');
-    taskElement.className = `task-item ${task.status.toLowerCase()}`;
+    taskElement.className = 'task-item';
     
-    const dueDate = task.dueDate ? new Date(task.dueDate).toLocaleDateString() : 'No due date';
+    // Get key fields
+    const key = task.key;
+    const summary = task.fields?.summary || 'No summary';
+    const status = task.fields?.status?.name || 'Unknown';
+    const issuetype = task.fields?.issuetype?.name || 'Task';
+    const priority = task.fields?.priority?.name || 'Normal';
     
+    // Format due date if available
+    let dueDate = 'No due date';
+    if (task.fields?.duedate) {
+      const date = new Date(task.fields.duedate);
+      dueDate = date.toLocaleDateString();
+    }
+    
+    // Create task HTML
     taskElement.innerHTML = `
       <div class="task-header">
-        <span class="task-key">${task.key}</span>
-        <span class="task-status">${task.status}</span>
+        <span class="task-key">${key}</span>
+        <span class="task-status status-${status.toLowerCase().replace(/\s+/g, '-')}">${status}</span>
       </div>
-      <div class="task-summary">${task.summary}</div>
+      <div class="task-summary">${summary}</div>
       <div class="task-details">
-        <span class="task-assignee">${task.assignee || 'Unassigned'}</span>
+        <span class="task-type">${issuetype}</span>
+        <span class="task-priority">${priority}</span>
         <span class="task-due-date">${dueDate}</span>
+      </div>
+      <div class="task-actions">
+        <button class="task-action-button view-button">View</button>
+        <button class="task-action-button update-button">Update</button>
       </div>
     `;
     
-    // Add click event to open the task
-    taskElement.addEventListener('click', () => {
-      chrome.tabs.create({ url: task.url });
+    // Add click handler for view button
+    taskElement.querySelector('.view-button').addEventListener('click', () => {
+      chrome.storage.local.get('serverUrl', (data) => {
+        const jiraUrl = data.serverUrl ? 
+          data.serverUrl.replace(/\/api$/, '') : 
+          'https://your-domain.atlassian.net';
+        chrome.tabs.create({ url: `${jiraUrl}/browse/${key}` });
+      });
+    });
+    
+    // Add click handler for update button
+    taskElement.querySelector('.update-button').addEventListener('click', () => {
+      switchTab(tabChat);
+      userInput.value = `Update ${key} status`;
+      userInput.focus();
     });
     
     taskList.appendChild(taskElement);
@@ -535,67 +738,64 @@ function saveSettings() {
   const serverUrl = serverUrlInput.value.trim();
   const notificationsEnabled = notificationsToggle.checked;
   
+  // Validate server URL
+  if (!serverUrl) {
+    alert('Please enter a valid server URL');
+    return;
+  }
+  
+  // Save settings
   chrome.storage.local.set({
     serverUrl,
     notificationsEnabled
   }, () => {
-    // Show saved message
-    const savedIndicator = document.createElement('div');
-    savedIndicator.className = 'saved-indicator';
-    savedIndicator.textContent = 'Settings saved!';
+    // Show success feedback
+    const saveButton = document.getElementById('save-settings');
+    saveButton.textContent = 'Saved!';
+    saveButton.classList.add('success');
     
-    settingsContent.appendChild(savedIndicator);
-    
-    // Remove after 2 seconds
+    // Revert button text after 2 seconds
     setTimeout(() => {
-      settingsContent.removeChild(savedIndicator);
+      saveButton.textContent = 'Save Settings';
+      saveButton.classList.remove('success');
     }, 2000);
     
-    // Check connection with new URL
+    // Check server connection with new URL
     checkServerConnection();
   });
 }
 
-// Handle file attachment
+// Handle attachment button click
 function handleAttachment() {
-  // Create a file input element
+  // Check if authenticated
+  if (!isAuthenticated) {
+    addMessage('bot', 'Please log in with Jira to upload attachments.');
+    return;
+  }
+  
+  // Create file input
   const fileInput = document.createElement('input');
   fileInput.type = 'file';
-  fileInput.accept = 'image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt';
+  fileInput.accept = 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.txt';
   
-  // Trigger click event to open file picker
+  // Trigger file selection
   fileInput.click();
   
   // Handle file selection
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files.length > 0) {
-      const file = fileInput.files[0];
-      
-      // Add message about the attachment
-      addMessage('user', `Attached file: ${file.name}`);
-      
-      // Create FormData and send to server via background script
-      const formData = new FormData();
-      formData.append('file', file);
-      
-      // Preview for certain file types
-      if (file.type.startsWith('image/')) {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = document.createElement('img');
-          img.src = e.target.result;
-          img.className = 'attachment-preview';
-          chatMessages.appendChild(img);
-          chatMessages.scrollTop = chatMessages.scrollHeight;
-        };
-        reader.readAsDataURL(file);
-      }
-      
-      // TODO: Implement file upload to server (requires additional backend support)
-      // For now, just show a message
-      setTimeout(() => {
-        addMessage('bot', `I've received your file "${file.name}". What would you like me to do with it?`);
-      }, 1000);
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    // Validate file size (max 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      addMessage('bot', 'File too large. Maximum size is 10MB.');
+      return;
     }
+    
+    // Show file selection in UI
+    addMessage('user', `📎 Selected file: ${file.name}`);
+    
+    // Here you would upload the file to the server
+    // This requires additional implementation in the API
   });
 } 

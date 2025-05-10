@@ -31,6 +31,10 @@ var taskList = document.getElementById('task-list');
 // Chat history
 var chatHistory = [];
 
+// Auth state
+var isAuthenticated = false;
+var currentUser = null;
+
 // Input suggestions based on context
 var inputSuggestions = {
   "default": ["Create a task for me to review the documentation by Friday", "List my open tasks with high priority", "Remind me to follow up with the team tomorrow at 9 AM", "Schedule a meeting for next week", "Upload evidence for task PROJ-123"],
@@ -49,6 +53,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
   // Check server connection
   checkServerConnection();
+
+  // Check authentication status
+  checkAuthStatus();
 
   // Load chat history
   loadChatHistory();
@@ -81,12 +88,94 @@ document.addEventListener('DOMContentLoaded', function () {
 
 // Load settings from storage
 function loadSettings() {
-  chrome.storage.local.get(['serverUrl', 'notificationsEnabled'], function (data) {
+  chrome.storage.local.get(['serverUrl', 'notificationsEnabled', 'isAuthenticated'], function (data) {
     if (data.serverUrl) {
       serverUrlInput.value = data.serverUrl;
     }
     if (data.notificationsEnabled !== undefined) {
       notificationsToggle.checked = data.notificationsEnabled;
+    }
+    isAuthenticated = data.isAuthenticated || false;
+  });
+}
+
+// Check authentication status
+function checkAuthStatus() {
+  chrome.runtime.sendMessage({
+    type: 'AUTH_STATUS'
+  }, function (response) {
+    if (response.success) {
+      isAuthenticated = response.data.authenticated;
+      currentUser = response.data.user;
+      updateAuthUI();
+    } else {
+      console.error('Failed to check authentication status:', response.error);
+      isAuthenticated = false;
+      updateAuthUI();
+    }
+  });
+}
+
+// Update UI based on authentication status
+function updateAuthUI() {
+  // Add Auth UI to settings tab if it doesn't exist
+  if (!document.getElementById('auth-settings')) {
+    var authGroup = document.createElement('div');
+    authGroup.id = 'auth-settings';
+    authGroup.className = 'settings-group auth-settings';
+    authGroup.innerHTML = "\n      <label>Authentication</label>\n      <div id=\"auth-status\" class=\"auth-status\"></div>\n      <div id=\"auth-buttons\" class=\"auth-buttons\"></div>\n    ";
+
+    // Insert before save button
+    var saveGroup = document.querySelector('.settings-group:last-child');
+    settingsContent.insertBefore(authGroup, saveGroup);
+  }
+
+  // Update auth status display
+  var authStatus = document.getElementById('auth-status');
+  var authButtons = document.getElementById('auth-buttons');
+  if (isAuthenticated && currentUser) {
+    authStatus.innerHTML = "\n      <div class=\"user-info\">\n        <span class=\"status-circle connected\"></span>\n        <span>Logged in as: <strong>".concat(currentUser.name || currentUser.email || currentUser.account_id, "</strong></span>\n      </div>\n    ");
+    authButtons.innerHTML = "\n      <button id=\"logout-button\" class=\"secondary-button\">Log Out</button>\n    ";
+
+    // Add logout event listener
+    document.getElementById('logout-button').addEventListener('click', handleLogout);
+  } else {
+    authStatus.innerHTML = "\n      <div class=\"user-info\">\n        <span class=\"status-circle disconnected\"></span>\n        <span>Not logged in</span>\n      </div>\n    ";
+    authButtons.innerHTML = "\n      <button id=\"login-button\" class=\"primary-button\">Log In with Jira</button>\n    ";
+
+    // Add login event listener
+    document.getElementById('login-button').addEventListener('click', handleLogin);
+  }
+}
+
+// Handle login button click
+function handleLogin() {
+  chrome.runtime.sendMessage({
+    type: 'AUTH_LOGIN'
+  }, function (response) {
+    if (!response.success) {
+      console.error('Failed to initiate login:', response.error);
+      // Show error in UI
+      addMessage('bot', 'Failed to log in. Please try again later.');
+    }
+  });
+}
+
+// Handle logout button click
+function handleLogout() {
+  chrome.runtime.sendMessage({
+    type: 'AUTH_LOGOUT'
+  }, function (response) {
+    if (response.success) {
+      isAuthenticated = false;
+      currentUser = null;
+      updateAuthUI();
+      // Show logout message
+      addMessage('bot', 'You have been logged out successfully.');
+    } else {
+      console.error('Failed to logout:', response.error);
+      // Show error in UI
+      addMessage('bot', 'Failed to log out. Please try again later.');
     }
   });
 }
@@ -219,10 +308,22 @@ function showSuggestions() {
     existingSuggestions.remove();
   }
 
-  // Create suggestions container
-  var suggestionsDiv = document.createElement('div');
-  suggestionsDiv.id = 'chat-suggestions';
-  suggestionsDiv.className = 'chat-suggestions';
+  // If not authenticated and not in settings tab, show login suggestion
+  if (!isAuthenticated && !document.getElementById('tab-settings').classList.contains('active')) {
+    var loginButton = document.createElement('button');
+    loginButton.className = 'suggestion-button login-suggestion';
+    loginButton.textContent = 'Log in with Jira to get started';
+    loginButton.onclick = function () {
+      switchTab(tabSettings);
+      setTimeout(function () {
+        var loginBtn = document.getElementById('login-button');
+        if (loginBtn) loginBtn.focus();
+      }, 100);
+    };
+    suggestionsDiv.appendChild(loginButton);
+    chatMessages.parentNode.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+    return;
+  }
 
   // Get relevant suggestions
   var suggestions = inputSuggestions[activeContextType] || inputSuggestions["default"];
@@ -232,24 +333,25 @@ function showSuggestions() {
     var button = document.createElement('button');
     button.className = 'suggestion-button';
     button.textContent = suggestion;
-    button.addEventListener('click', function () {
+    button.onclick = function () {
       userInput.value = suggestion;
       sendMessage();
-    });
+    };
     suggestionsDiv.appendChild(button);
   });
 
-  // Add to chat container
-  var chatContainer = document.querySelector('.chat-container');
-  chatContainer.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+  // Append suggestions to UI
+  if (suggestions.length > 0) {
+    chatMessages.parentNode.insertBefore(suggestionsDiv, document.querySelector('.input-container'));
+  }
 }
 
 // Set up event listeners
 function setupEventListeners() {
-  // Send message when button clicked
+  // Send button
   sendButton.addEventListener('click', sendMessage);
 
-  // Send message when Enter pressed (but allow Shift+Enter for new lines)
+  // User input
   userInput.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -257,273 +359,362 @@ function setupEventListeners() {
     }
   });
 
-  // Tab switching
-  tabChat.addEventListener('click', function () {
-    return switchTab('chat');
-  });
-  tabTasks.addEventListener('click', function () {
-    switchTab('tasks');
-    loadTasks();
-  });
-  tabSettings.addEventListener('click', function () {
-    return switchTab('settings');
-  });
+  // User input for suggestions
+  userInput.addEventListener('input', smartSuggestions);
 
-  // Save settings
-  saveSettingsButton.addEventListener('click', saveSettings);
-
-  // Attachment button
+  // Attach button
   attachButton.addEventListener('click', handleAttachment);
 
-  // Focus input when chat tab is active
+  // Tab buttons
   tabChat.addEventListener('click', function () {
-    setTimeout(function () {
-      return userInput.focus();
-    }, 100);
+    return switchTab(tabChat);
+  });
+  tabTasks.addEventListener('click', function () {
+    return switchTab(tabTasks);
+  });
+  tabSettings.addEventListener('click', function () {
+    return switchTab(tabSettings);
   });
 
-  // Update context when extension is opened
-  chrome.tabs.onActivated.addListener(function () {
-    updateJiraContext();
-  });
-
-  // Input changes - smart suggestions during typing
-  userInput.addEventListener('input', smartSuggestions);
+  // Save settings button
+  saveSettingsButton.addEventListener('click', saveSettings);
 }
 
-// Provide smart suggestions while typing
+// Show smarter suggestions based on partial typing
 function smartSuggestions() {
-  var input = userInput.value.toLowerCase().trim();
-
-  // Only suggest if at least 3 characters
+  var input = userInput.value.toLowerCase();
   if (input.length < 3) return;
 
-  // Common action words to detect
-  var createActions = ['create', 'add', 'make', 'new'];
-  var reminderActions = ['remind', 'notification', 'alert'];
-  var updateActions = ['update', 'change', 'modify', 'edit'];
-  var listActions = ['list', 'find', 'show', 'get', 'display'];
+  // Get relevant suggestions
+  var suggestions = inputSuggestions[activeContextType] || inputSuggestions["default"];
 
-  // Set placeholder based on detected intent
-  if (createActions.some(function (action) {
-    return input.includes(action);
-  }) && input.includes('task')) {
-    userInput.placeholder = 'Creating a task: Specify assignee, title, due date...';
-  } else if (reminderActions.some(function (action) {
-    return input.includes(action);
-  })) {
-    userInput.placeholder = 'Setting a reminder: Specify date, time, and details...';
-  } else if (updateActions.some(function (action) {
-    return input.includes(action);
-  }) && input.includes('status')) {
-    userInput.placeholder = 'Updating status: Specify task key and new status...';
-  } else if (listActions.some(function (action) {
-    return input.includes(action);
-  })) {
-    userInput.placeholder = 'Finding tasks: Specify criteria (assignee, status, etc.)...';
+  // Filter suggestions that partially match input
+  var matchingSuggestions = suggestions.filter(function (suggestion) {
+    return suggestion.toLowerCase().includes(input);
+  });
+
+  // Show up to 3 matching suggestions
+  if (matchingSuggestions.length > 0) {
+    // Remove existing suggestions
+    var existingSuggestions = document.getElementById('chat-suggestions');
+    if (existingSuggestions) {
+      existingSuggestions.remove();
+    }
+
+    // Create suggestions container
+    var _suggestionsDiv = document.createElement('div');
+    _suggestionsDiv.id = 'chat-suggestions';
+    _suggestionsDiv.className = 'chat-suggestions';
+
+    // Create buttons for each suggestion
+    matchingSuggestions.slice(0, 3).forEach(function (suggestion) {
+      var button = document.createElement('button');
+      button.className = 'suggestion-button';
+      button.textContent = suggestion;
+      button.onclick = function () {
+        userInput.value = suggestion;
+        sendMessage();
+      };
+      _suggestionsDiv.appendChild(button);
+    });
+
+    // Append suggestions to UI
+    chatMessages.parentNode.insertBefore(_suggestionsDiv, document.querySelector('.input-container'));
   }
 }
 
 // Switch between tabs
 function switchTab(tab) {
-  // Hide all tabs
-  document.querySelector('.chat-container').style.display = 'none';
+  // Remove active class from all tabs
+  [tabChat, tabTasks, tabSettings].forEach(function (t) {
+    return t.classList.remove('active');
+  });
+
+  // Add active class to selected tab
+  tab.classList.add('active');
+
+  // Hide all content
+  chatMessages.parentNode.style.display = 'none';
   tasksContent.style.display = 'none';
   settingsContent.style.display = 'none';
 
-  // Remove active class from all tab buttons
-  tabChat.classList.remove('active');
-  tabTasks.classList.remove('active');
-  tabSettings.classList.remove('active');
-
-  // Show selected tab
-  switch (tab) {
-    case 'tasks':
-      tasksContent.style.display = 'block';
-      tabTasks.classList.add('active');
-      break;
-    case 'settings':
-      settingsContent.style.display = 'block';
-      tabSettings.classList.add('active');
-      break;
-    default:
-      document.querySelector('.chat-container').style.display = 'block';
-      tabChat.classList.add('active');
+  // Show content based on selected tab
+  if (tab === tabChat) {
+    chatMessages.parentNode.style.display = 'flex';
+    showSuggestions();
+  } else if (tab === tabTasks) {
+    tasksContent.style.display = 'block';
+    loadTasks();
+  } else if (tab === tabSettings) {
+    settingsContent.style.display = 'block';
+    updateAuthUI();
   }
 }
 
-// Send message to the server and process response
+// Send message to API
 function sendMessage() {
-  var message = userInput.value.trim();
-  if (!message) return;
-
-  // Add user message to UI
-  addMessage('user', message);
-
-  // Clear input
-  userInput.value = '';
-
-  // Reset placeholder
-  if (activeContextType === 'jiraIssue') {
-    userInput.placeholder = "Ask about ".concat(currentJiraContext.issueKey, "...");
-  } else if (activeContextType === 'jiraBoard') {
-    userInput.placeholder = 'Ask about Jira board or project...';
-  } else {
-    userInput.placeholder = 'Type your message here... (e.g., "Create a task for John to review docs by Monday")';
-  }
-
-  // Remove suggestions
-  var existingSuggestions = document.getElementById('chat-suggestions');
-  if (existingSuggestions) {
-    existingSuggestions.remove();
-  }
-
-  // Get current Jira context if available
-  getCurrentTabInfo().then(function (tabInfo) {
-    // Show typing indicator
-    addMessageToUI('bot', '<div class="typing-indicator"><span></span><span></span><span></span></div>', new Date().toISOString());
-
-    // Send to server via background script
-    chrome.runtime.sendMessage({
-      type: 'API_REQUEST',
-      endpoint: '/chat',
-      method: 'POST',
-      data: {
-        message: message,
-        context: tabInfo
-      }
-    }, function (response) {
-      // Remove typing indicator
-      chatMessages.removeChild(chatMessages.lastChild);
-      if (response && response.success) {
-        // Add bot response to chat
-        addMessage('bot', response.data.response);
-
-        // Handle actions if any were returned
-        handleActions(response.data.actions);
-
-        // Update context in case it changed
-        updateJiraContext();
-      } else {
-        // Show error message
-        addMessage('bot', 'Sorry, I encountered an error while processing your request. Please try again later.');
-      }
-    });
-  });
-}
-
-// Get info about the current tab for context
-function getCurrentTabInfo() {
-  return _getCurrentTabInfo.apply(this, arguments);
-} // Handle any actions returned from the server
-function _getCurrentTabInfo() {
-  _getCurrentTabInfo = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee() {
+  return _sendMessage.apply(this, arguments);
+} // Get info about current tab
+function _sendMessage() {
+  _sendMessage = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee() {
+    var message, existingSuggestions, typingIndicator, messageData;
     return _regeneratorRuntime().wrap(function _callee$(_context) {
       while (1) switch (_context.prev = _context.next) {
         case 0:
-          return _context.abrupt("return", new Promise(function (resolve) {
-            chrome.tabs.query({
-              active: true,
-              currentWindow: true
-            }, function (tabs) {
-              if (tabs.length === 0) {
-                resolve({});
-                return;
-              }
-              var currentTab = tabs[0];
+          message = userInput.value.trim();
+          if (message) {
+            _context.next = 3;
+            break;
+          }
+          return _context.abrupt("return");
+        case 3:
+          // Clear input
+          userInput.value = '';
 
-              // If it's a Jira page, try to get additional context
-              if (currentTab.url.includes('atlassian.net') || currentTab.url.includes('jira')) {
-                chrome.tabs.sendMessage(currentTab.id, {
-                  type: 'GET_JIRA_CONTEXT'
-                }, function (response) {
-                  if (chrome.runtime.lastError || !response) {
-                    // If content script not available or no response
-                    resolve({
-                      url: currentTab.url,
-                      title: currentTab.title
-                    });
-                  } else {
-                    resolve(response);
-                  }
-                });
+          // Remove suggestions
+          existingSuggestions = document.getElementById('chat-suggestions');
+          if (existingSuggestions) {
+            existingSuggestions.remove();
+          }
+
+          // Add user message to UI
+          addMessage('user', message);
+
+          // Add typing indicator
+          typingIndicator = document.createElement('div');
+          typingIndicator.className = 'message bot-message typing-indicator';
+          typingIndicator.innerHTML = '<div class="dots"><span>.</span><span>.</span><span>.</span></div>';
+          chatMessages.appendChild(typingIndicator);
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+
+          // Check if authenticated
+          if (isAuthenticated) {
+            _context.next = 16;
+            break;
+          }
+          // Remove typing indicator
+          typingIndicator.remove();
+
+          // Add response about authentication
+          addMessage('bot', 'Please log in with Jira to use the chatbot. Go to the Settings tab to log in.');
+          return _context.abrupt("return");
+        case 16:
+          try {
+            // Prepare message with context
+            messageData = {
+              text: message,
+              context: currentJiraContext
+            }; // Send to API
+            chrome.runtime.sendMessage({
+              type: 'API_REQUEST',
+              endpoint: '/api/chat',
+              method: 'POST',
+              data: messageData
+            }, function (response) {
+              // Remove typing indicator
+              typingIndicator.remove();
+              if (response.success) {
+                // Add bot response to UI
+                addMessage('bot', response.data.response);
+
+                // Handle actions if any
+                if (response.data.actions) {
+                  handleActions(response.data.actions);
+                }
               } else {
-                // Not a Jira page
-                resolve({
-                  url: currentTab.url,
-                  title: currentTab.title
-                });
+                // Add error message to UI
+                addMessage('bot', "Sorry, I couldn't process your request. ".concat(response.error));
+
+                // If unauthorized, update auth status
+                if (response.error.includes('401') || response.error.includes('unauthorized')) {
+                  checkAuthStatus();
+                }
               }
             });
-          }));
-        case 1:
+          } catch (error) {
+            // Remove typing indicator
+            typingIndicator.remove();
+
+            // Add error message to UI
+            addMessage('bot', "Sorry, something went wrong. ".concat(error.message));
+            console.error('Error sending message:', error);
+          }
+        case 17:
         case "end":
           return _context.stop();
       }
     }, _callee);
   }));
+  return _sendMessage.apply(this, arguments);
+}
+function getCurrentTabInfo() {
+  return _getCurrentTabInfo.apply(this, arguments);
+} // Handle suggested actions
+function _getCurrentTabInfo() {
+  _getCurrentTabInfo = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee2() {
+    return _regeneratorRuntime().wrap(function _callee2$(_context2) {
+      while (1) switch (_context2.prev = _context2.next) {
+        case 0:
+          return _context2.abrupt("return", new Promise(function (resolve) {
+            chrome.tabs.query({
+              active: true,
+              currentWindow: true
+            }, function (tabs) {
+              if (tabs.length === 0) {
+                resolve({
+                  isJiraPage: false
+                });
+                return;
+              }
+              var url = tabs[0].url;
+              var title = tabs[0].title;
+
+              // Check if this is a Jira page
+              var isJiraPage = url.includes('atlassian.net') || url.includes('jira');
+
+              // Extract issue key if present in URL or title
+              var issueKeyRegex = /\b([A-Z]+-[0-9]+)\b/;
+              var urlMatch = url.match(issueKeyRegex);
+              var titleMatch = title.match(issueKeyRegex);
+              var issueKey = urlMatch ? urlMatch[1] : titleMatch ? titleMatch[1] : null;
+
+              // Extract project key if found
+              var projectKeyRegex = /projects\/([A-Z]+)/;
+              var projectMatch = url.match(projectKeyRegex);
+              var projectKey = projectMatch ? projectMatch[1] : null;
+              resolve({
+                isJiraPage: isJiraPage,
+                issueKey: issueKey,
+                projectKey: projectKey,
+                url: url,
+                title: title
+              });
+            });
+          }));
+        case 1:
+        case "end":
+          return _context2.stop();
+      }
+    }, _callee2);
+  }));
   return _getCurrentTabInfo.apply(this, arguments);
 }
 function handleActions(actions) {
-  if (!actions || actions.length === 0) return;
+  // Remove existing actions
+  var existingActions = document.getElementById('suggested-actions');
+  if (existingActions) {
+    existingActions.remove();
+  }
+
+  // Create actions container
+  var actionsDiv = document.createElement('div');
+  actionsDiv.id = 'suggested-actions';
+  actionsDiv.className = 'suggested-actions';
+
+  // Add heading
+  var heading = document.createElement('div');
+  heading.className = 'actions-heading';
+  heading.textContent = 'Suggested Actions:';
+  actionsDiv.appendChild(heading);
+
+  // Create buttons for each action
   actions.forEach(function (action) {
-    switch (action.type) {
-      case 'open_url':
+    var button = document.createElement('button');
+    button.className = 'action-button';
+    button.textContent = action.text;
+    if (action.url) {
+      // Open URL action
+      button.onclick = function () {
         chrome.tabs.create({
-          url: action.data.url
+          url: action.url
         });
-        break;
-      case 'show_notification':
-        chrome.runtime.sendMessage({
-          type: 'SHOW_NOTIFICATION',
-          title: action.data.title,
-          message: action.data.message,
-          actions: action.data.actions
-        });
-        break;
-      case 'refresh_tasks':
-        if (tabTasks.classList.contains('active')) {
-          loadTasks();
-        }
-        break;
+      };
+    } else if (action.action) {
+      // Custom action
+      button.onclick = function () {
+        // Handle different action types
+        // ...
+      };
     }
+    actionsDiv.appendChild(button);
   });
+
+  // Append actions to UI
+  chatMessages.appendChild(actionsDiv);
+
+  // Scroll to bottom
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-// Load tasks from server
+// Load tasks from API
 function loadTasks() {
+  // Show loading indicator
   taskList.innerHTML = '<div class="loading-indicator">Loading tasks...</div>';
+
+  // Check if authenticated
+  if (!isAuthenticated) {
+    taskList.innerHTML = '<div class="no-tasks">Please log in with Jira to see your tasks.</div>';
+    return;
+  }
+
+  // Fetch tasks
   chrome.runtime.sendMessage({
     type: 'API_REQUEST',
-    endpoint: '/tasks',
+    endpoint: '/api/jira/tasks',
     method: 'GET'
   }, function (response) {
-    if (response && response.success) {
-      displayTasks(response.data.tasks);
+    if (response.success) {
+      displayTasks(response.data.issues || []);
     } else {
-      taskList.innerHTML = '<div class="error-message">Failed to load tasks. Please try again later.</div>';
+      taskList.innerHTML = "<div class=\"error-message\">Failed to load tasks: ".concat(response.error, "</div>");
     }
   });
 }
 
 // Display tasks in the UI
 function displayTasks(tasks) {
-  if (!tasks || tasks.length === 0) {
-    taskList.innerHTML = '<div class="empty-message">No tasks found.</div>';
+  if (tasks.length === 0) {
+    taskList.innerHTML = '<div class="no-tasks">No tasks found.</div>';
     return;
   }
   taskList.innerHTML = '';
   tasks.forEach(function (task) {
+    var _task$fields, _task$fields2, _task$fields3, _task$fields4, _task$fields5;
     var taskElement = document.createElement('div');
-    taskElement.className = "task-item ".concat(task.status.toLowerCase());
-    var dueDate = task.dueDate ? new Date(task.dueDate).toLocaleDateString() : 'No due date';
-    taskElement.innerHTML = "\n      <div class=\"task-header\">\n        <span class=\"task-key\">".concat(task.key, "</span>\n        <span class=\"task-status\">").concat(task.status, "</span>\n      </div>\n      <div class=\"task-summary\">").concat(task.summary, "</div>\n      <div class=\"task-details\">\n        <span class=\"task-assignee\">").concat(task.assignee || 'Unassigned', "</span>\n        <span class=\"task-due-date\">").concat(dueDate, "</span>\n      </div>\n    ");
+    taskElement.className = 'task-item';
 
-    // Add click event to open the task
-    taskElement.addEventListener('click', function () {
-      chrome.tabs.create({
-        url: task.url
+    // Get key fields
+    var key = task.key;
+    var summary = ((_task$fields = task.fields) === null || _task$fields === void 0 ? void 0 : _task$fields.summary) || 'No summary';
+    var status = ((_task$fields2 = task.fields) === null || _task$fields2 === void 0 || (_task$fields2 = _task$fields2.status) === null || _task$fields2 === void 0 ? void 0 : _task$fields2.name) || 'Unknown';
+    var issuetype = ((_task$fields3 = task.fields) === null || _task$fields3 === void 0 || (_task$fields3 = _task$fields3.issuetype) === null || _task$fields3 === void 0 ? void 0 : _task$fields3.name) || 'Task';
+    var priority = ((_task$fields4 = task.fields) === null || _task$fields4 === void 0 || (_task$fields4 = _task$fields4.priority) === null || _task$fields4 === void 0 ? void 0 : _task$fields4.name) || 'Normal';
+
+    // Format due date if available
+    var dueDate = 'No due date';
+    if ((_task$fields5 = task.fields) !== null && _task$fields5 !== void 0 && _task$fields5.duedate) {
+      var date = new Date(task.fields.duedate);
+      dueDate = date.toLocaleDateString();
+    }
+
+    // Create task HTML
+    taskElement.innerHTML = "\n      <div class=\"task-header\">\n        <span class=\"task-key\">".concat(key, "</span>\n        <span class=\"task-status status-").concat(status.toLowerCase().replace(/\s+/g, '-'), "\">").concat(status, "</span>\n      </div>\n      <div class=\"task-summary\">").concat(summary, "</div>\n      <div class=\"task-details\">\n        <span class=\"task-type\">").concat(issuetype, "</span>\n        <span class=\"task-priority\">").concat(priority, "</span>\n        <span class=\"task-due-date\">").concat(dueDate, "</span>\n      </div>\n      <div class=\"task-actions\">\n        <button class=\"task-action-button view-button\">View</button>\n        <button class=\"task-action-button update-button\">Update</button>\n      </div>\n    ");
+
+    // Add click handler for view button
+    taskElement.querySelector('.view-button').addEventListener('click', function () {
+      chrome.storage.local.get('serverUrl', function (data) {
+        var jiraUrl = data.serverUrl ? data.serverUrl.replace(/\/api$/, '') : 'https://your-domain.atlassian.net';
+        chrome.tabs.create({
+          url: "".concat(jiraUrl, "/browse/").concat(key)
+        });
       });
+    });
+
+    // Add click handler for update button
+    taskElement.querySelector('.update-button').addEventListener('click', function () {
+      switchTab(tabChat);
+      userInput.value = "Update ".concat(key, " status");
+      userInput.focus();
     });
     taskList.appendChild(taskElement);
   });
@@ -533,67 +724,66 @@ function displayTasks(tasks) {
 function saveSettings() {
   var serverUrl = serverUrlInput.value.trim();
   var notificationsEnabled = notificationsToggle.checked;
+
+  // Validate server URL
+  if (!serverUrl) {
+    alert('Please enter a valid server URL');
+    return;
+  }
+
+  // Save settings
   chrome.storage.local.set({
     serverUrl: serverUrl,
     notificationsEnabled: notificationsEnabled
   }, function () {
-    // Show saved message
-    var savedIndicator = document.createElement('div');
-    savedIndicator.className = 'saved-indicator';
-    savedIndicator.textContent = 'Settings saved!';
-    settingsContent.appendChild(savedIndicator);
+    // Show success feedback
+    var saveButton = document.getElementById('save-settings');
+    saveButton.textContent = 'Saved!';
+    saveButton.classList.add('success');
 
-    // Remove after 2 seconds
+    // Revert button text after 2 seconds
     setTimeout(function () {
-      settingsContent.removeChild(savedIndicator);
+      saveButton.textContent = 'Save Settings';
+      saveButton.classList.remove('success');
     }, 2000);
 
-    // Check connection with new URL
+    // Check server connection with new URL
     checkServerConnection();
   });
 }
 
-// Handle file attachment
+// Handle attachment button click
 function handleAttachment() {
-  // Create a file input element
+  // Check if authenticated
+  if (!isAuthenticated) {
+    addMessage('bot', 'Please log in with Jira to upload attachments.');
+    return;
+  }
+
+  // Create file input
   var fileInput = document.createElement('input');
   fileInput.type = 'file';
-  fileInput.accept = 'image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt';
+  fileInput.accept = 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.txt';
 
-  // Trigger click event to open file picker
+  // Trigger file selection
   fileInput.click();
 
   // Handle file selection
-  fileInput.addEventListener('change', function () {
-    if (fileInput.files.length > 0) {
-      var file = fileInput.files[0];
+  fileInput.addEventListener('change', function (e) {
+    var file = e.target.files[0];
+    if (!file) return;
 
-      // Add message about the attachment
-      addMessage('user', "Attached file: ".concat(file.name));
-
-      // Create FormData and send to server via background script
-      var formData = new FormData();
-      formData.append('file', file);
-
-      // Preview for certain file types
-      if (file.type.startsWith('image/')) {
-        var reader = new FileReader();
-        reader.onload = function (e) {
-          var img = document.createElement('img');
-          img.src = e.target.result;
-          img.className = 'attachment-preview';
-          chatMessages.appendChild(img);
-          chatMessages.scrollTop = chatMessages.scrollHeight;
-        };
-        reader.readAsDataURL(file);
-      }
-
-      // TODO: Implement file upload to server (requires additional backend support)
-      // For now, just show a message
-      setTimeout(function () {
-        addMessage('bot', "I've received your file \"".concat(file.name, "\". What would you like me to do with it?"));
-      }, 1000);
+    // Validate file size (max 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      addMessage('bot', 'File too large. Maximum size is 10MB.');
+      return;
     }
+
+    // Show file selection in UI
+    addMessage('user', "\uD83D\uDCCE Selected file: ".concat(file.name));
+
+    // Here you would upload the file to the server
+    // This requires additional implementation in the API
   });
 }
 /******/ })()

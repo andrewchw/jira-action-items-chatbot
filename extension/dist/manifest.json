@@ -6,7 +6,8 @@
   "permissions": [
     "storage", 
     "tabs", 
-    "notifications"
+    "notifications",
+    "identity"
   ],
   "background": {
     "service_worker": "background.js"
