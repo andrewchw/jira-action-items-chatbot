@@ -14,6 +14,7 @@ from app.core.config import settings
 from sqlalchemy.orm import Session
 import hashlib
 from app.api.auth import get_current_user
+import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -52,11 +53,18 @@ def get_jira_client(request = None, db = None):
     return jira_client
 
 @router.get("/health")
-async def health_check() -> Dict[str, str]:
+async def health_check():
     """
-    Health check endpoint to verify API is running.
+    Simple health check endpoint to verify the server is running.
+    
+    Returns:
+        Status information including server version
     """
-    return {"status": "healthy"}
+    return {
+        "status": "ok",
+        "version": settings.API_VERSION,
+        "server": "Jira Action Items Chatbot API"
+    }
 
 @router.get("/")
 async def root() -> Dict[str, str]:
@@ -424,15 +432,42 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
     """
     try:
         start_time = datetime.now()
-        logger.info(f"Processing chat message: {message.text[:50]}...")
+        
+        # Sanitize input text to prevent processing errors
+        if not message.text or not isinstance(message.text, str):
+            logger.warning("Received empty or invalid message text")
+            return ChatResponse(
+                response="I couldn't understand your message. Please try again with a clear question or request.",
+                timestamp=datetime.now()
+            )
+        
+        # Truncate extremely long messages and remove invalid characters
+        sanitized_text = message.text[:1000]  # Limit to 1000 chars
+        sanitized_text = re.sub(r'[^\w\s.,;:!?\'"-=+*/\\@#$%^&(){}\[\]<>|]', '', sanitized_text).strip()
+        
+        if not sanitized_text:
+            logger.warning(f"Message contained only invalid characters: {message.text[:50]}...")
+            return ChatResponse(
+                response="Your message contained only special characters I couldn't process. Please try again with a normal text query.",
+                timestamp=datetime.now()
+            )
+        
+        logger.info(f"Processing chat message: {sanitized_text[:50]}...")
         
         # Process the user's message to determine intent and extract entities
-        processed = prompt_manager.process_user_input(message.text)
-        intent = processed["intent"]
-        entities = processed["entities"]
-        messages = processed["messages"]
-        
-        logger.info(f"Detected intent: {intent} from message: {message.text[:50]}...")
+        try:
+            processed = prompt_manager.process_user_input(sanitized_text)
+            intent = processed["intent"]
+            entities = processed["entities"]
+            messages = processed["messages"]
+            
+            logger.info(f"Detected intent: {intent} from message: {sanitized_text[:50]}...")
+        except Exception as e:
+            logger.error(f"Error processing intent: {str(e)}")
+            return ChatResponse(
+                response="I had trouble understanding your request. Could you please rephrase it?",
+                timestamp=datetime.now()
+            )
         
         # Try to retrieve user preferences from memory
         try:
@@ -447,7 +482,7 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                 await memory_service.add_observations([
                     {
                         "entityName": "current_user",
-                        "contents": [f"Asked about: {message.text[:50]}..."]
+                        "contents": [f"Asked about: {sanitized_text[:50]}..."]
                     }
                 ])
         except Exception as e:
@@ -541,7 +576,15 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             )
             
             # Extract the response text
-            response_text = llm_response["choices"][0]["message"]["content"]
+            try:
+                if not llm_response or "choices" not in llm_response or not llm_response["choices"]:
+                    logger.error(f"LLM service error: Invalid response format - {llm_response}")
+                    response_text = "I'm sorry, I encountered an issue processing your request. Please try again or rephrase your query."
+                else:
+                    response_text = llm_response["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.error(f"LLM service error: {str(e)}")
+                response_text = "I'm sorry, I encountered an issue processing your request. Please try again or rephrase your query."
             
             # Generate suggested actions based on intent and entities
             actions = []
@@ -634,7 +677,7 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             logger.error(f"LLM service error: {str(e)}")
             
             # Use fallback response with detailed context
-            fallback_message = await llm_service.fallback_response(message.text)
+            fallback_message = await llm_service.fallback_response(sanitized_text)
             
             # Add additional context if it's a Jira-related error
             if jira_related:

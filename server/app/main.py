@@ -7,6 +7,11 @@ import os
 import subprocess
 import time
 from starlette.middleware.base import BaseHTTPMiddleware
+import json
+from datetime import datetime
+import asyncio
+import nltk
+from pathlib import Path
 
 # Fix path for FastAPI compatibility issues
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,8 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import app modules after path fix
 from app.api import endpoints
 from app.api import auth  # Import the auth module
+from app.api import reminders  # Import the reminders module
 from app.core.config import settings, get_settings
 from app.services.memory import memory_service
+from app.services.reminders import reminder_service  # Import the reminder service
 from app.models.database import db_manager
 from app.api.errors import register_exception_handlers
 
@@ -25,6 +32,28 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Make sure NLTK data is downloaded during startup
+try:
+    # Create NLTK data directory if it doesn't exist
+    nltk_data_dir = Path.home() / 'nltk_data'
+    nltk_data_dir.mkdir(exist_ok=True)
+    
+    # Download required NLTK data
+    logger.info("Checking for required NLTK data...")
+    for resource in ['punkt', 'averaged_perceptron_tagger']:
+        try:
+            if resource == 'punkt':
+                nltk.data.find('tokenizers/punkt')
+            else:
+                nltk.data.find(f'taggers/{resource}')
+        except LookupError:
+            logger.info(f"Downloading NLTK resource: {resource}")
+            nltk.download(resource, quiet=True)
+            logger.info(f"Successfully downloaded {resource}")
+except Exception as e:
+    logger.error(f"Error setting up NLTK data: {str(e)}")
+    logger.info("Application will continue with fallback tokenization")
 
 # Add request timing middleware
 class TimingMiddleware(BaseHTTPMiddleware):
@@ -91,6 +120,13 @@ def create_application() -> FastAPI:
         tags=["auth"],
     )
     
+    # Include reminder endpoints
+    application.include_router(
+        reminders.router,
+        prefix="/api/reminders",
+        tags=["reminders"],
+    )
+    
     # Define startup and shutdown events
     @application.on_event("startup")
     async def startup_event():
@@ -107,6 +143,15 @@ def create_application() -> FastAPI:
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             logger.warning("Starting with limited database functionality")
+        
+        # Start reminder service
+        try:
+            logger.info("Starting reminder service...")
+            await reminder_service.start()
+            logger.info("Reminder service started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start reminder service: {e}")
+            logger.warning("Starting with limited reminder functionality")
         
         # Fall back to alternative memory implementation if MCP server is not available
         try:
@@ -132,6 +177,13 @@ def create_application() -> FastAPI:
         Clean up resources on shutdown
         """
         logger.info("Shutting down application...")
+        
+        # Stop reminder service
+        try:
+            await reminder_service.stop()
+            logger.info("Reminder service stopped")
+        except Exception as e:
+            logger.error(f"Error stopping reminder service: {e}")
         
         # Stop memory service if it was started
         try:

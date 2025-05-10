@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reply to Reminder</title>
+  <link rel="stylesheet" href="../styles/popup.css">
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      background-color: #f8f9fa;
+      min-width: 100%;
+      min-height: 100%;
+      box-sizing: border-box;
+      color: #172b4d;
+    }
+    
+    .reply-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    
+    h3 {
+      margin: 0 0 4px 0;
+      font-size: 16px;
+    }
+    
+    .task-key {
+      color: #0052cc;
+      font-weight: 500;
+    }
+    
+    textarea {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      resize: vertical;
+      min-height: 60px;
+      box-sizing: border-box;
+    }
+    
+    .button-row {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    
+    .button {
+      background-color: #0052cc;
+      color: white;
+      border: none;
+      border-radius: 3px;
+      padding: 8px 16px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    
+    .button:hover {
+      background-color: #0747a6;
+    }
+    
+    .cancel-button {
+      background-color: #ebecf0;
+      color: #172b4d;
+    }
+    
+    .cancel-button:hover {
+      background-color: #dfe1e6;
+    }
+    
+    .helper-text {
+      font-size: 12px;
+      color: #5e6c84;
+      margin-top: 4px;
+    }
+    
+    .examples {
+      font-size: 12px;
+      color: #5e6c84;
+      margin-top: 8px;
+    }
+    
+    .examples ul {
+      margin: 4px 0 0 0;
+      padding-left: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="reply-container">
+    <div>
+      <h3>Reply to <span id="task-key" class="task-key">TASK-123</span></h3>
+      <div class="helper-text">Type a response to this task reminder:</div>
+    </div>
+    
+    <textarea id="reply-input" placeholder="Type your reply here..." autofocus></textarea>
+    
+    <div class="examples">
+      <div>Example replies:</div>
+      <ul>
+        <li>"Done" - Mark as completed</li>
+        <li>"I'll do it tomorrow" - Snooze the task</li>
+        <li>"Need to add more details" - Add as comment</li>
+      </ul>
+    </div>
+    
+    <div class="button-row">
+      <button id="cancel-button" class="button cancel-button">Cancel</button>
+      <button id="send-button" class="button">Send</button>
+    </div>
+  </div>
+  
+  <script src="reply.js"></script>
+</body>
+</html> 

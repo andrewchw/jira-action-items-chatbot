@@ -20,11 +20,17 @@ var statusCircle = document.getElementById('status-circle');
 var statusText = document.getElementById('status-text');
 var tabChat = document.getElementById('tab-chat');
 var tabTasks = document.getElementById('tab-tasks');
+var tabReminders = document.getElementById('tab-reminders');
 var tabSettings = document.getElementById('tab-settings');
 var tasksContent = document.getElementById('tasks-content');
+var remindersContent = document.getElementById('reminders-content');
 var settingsContent = document.getElementById('settings-content');
 var serverUrlInput = document.getElementById('server-url');
 var notificationsToggle = document.getElementById('notifications-toggle');
+var reminderToggle = document.getElementById('reminder-toggle');
+var checkRemindersButton = document.getElementById('check-reminders-button');
+var testReminderButton = document.getElementById('test-reminder-button');
+var remindersList = document.getElementById('reminders-list');
 var saveSettingsButton = document.getElementById('save-settings');
 var taskList = document.getElementById('task-list');
 
@@ -94,6 +100,7 @@ function loadSettings() {
     }
     if (data.notificationsEnabled !== undefined) {
       notificationsToggle.checked = data.notificationsEnabled;
+      reminderToggle.checked = data.notificationsEnabled;
     }
     isAuthenticated = data.isAuthenticated || false;
   });
@@ -184,7 +191,7 @@ function handleLogout() {
 function checkServerConnection() {
   chrome.storage.local.get('serverUrl', function (data) {
     var serverUrl = data.serverUrl || 'http://localhost:8000';
-    fetch("".concat(serverUrl, "/health"), {
+    fetch("".concat(serverUrl, "/api/health"), {
       method: 'GET'
     }).then(function (response) {
       if (response.ok) {
@@ -372,9 +379,17 @@ function setupEventListeners() {
   tabTasks.addEventListener('click', function () {
     return switchTab(tabTasks);
   });
+  tabReminders.addEventListener('click', function () {
+    return switchTab(tabReminders);
+  });
   tabSettings.addEventListener('click', function () {
     return switchTab(tabSettings);
   });
+
+  // Reminder buttons
+  checkRemindersButton.addEventListener('click', handleCheckReminders);
+  testReminderButton.addEventListener('click', handleTestReminder);
+  reminderToggle.addEventListener('change', saveReminderSettings);
 
   // Save settings button
   saveSettingsButton.addEventListener('click', saveSettings);
@@ -426,7 +441,7 @@ function smartSuggestions() {
 // Switch between tabs
 function switchTab(tab) {
   // Remove active class from all tabs
-  [tabChat, tabTasks, tabSettings].forEach(function (t) {
+  [tabChat, tabTasks, tabReminders, tabSettings].forEach(function (t) {
     return t.classList.remove('active');
   });
 
@@ -436,6 +451,7 @@ function switchTab(tab) {
   // Hide all content
   chatMessages.parentNode.style.display = 'none';
   tasksContent.style.display = 'none';
+  remindersContent.style.display = 'none';
   settingsContent.style.display = 'none';
 
   // Show content based on selected tab
@@ -445,6 +461,9 @@ function switchTab(tab) {
   } else if (tab === tabTasks) {
     tasksContent.style.display = 'block';
     loadTasks();
+  } else if (tab === tabReminders) {
+    remindersContent.style.display = 'block';
+    loadRecentReminders();
   } else if (tab === tabSettings) {
     settingsContent.style.display = 'block';
     updateAuthUI();
@@ -784,6 +803,150 @@ function handleAttachment() {
 
     // Here you would upload the file to the server
     // This requires additional implementation in the API
+  });
+}
+
+// Handle checking for reminders
+function handleCheckReminders() {
+  // Disable button while checking
+  checkRemindersButton.disabled = true;
+  checkRemindersButton.textContent = 'Checking...';
+
+  // Show checking message
+  var loadingItem = document.createElement('div');
+  loadingItem.className = 'reminder-item loading';
+  loadingItem.innerHTML = '<div class="reminder-title">Checking for reminders...</div>';
+  remindersList.innerHTML = '';
+  remindersList.appendChild(loadingItem);
+
+  // Check authentication
+  if (!isAuthenticated) {
+    remindersList.innerHTML = '<div class="no-reminders">Please log in with Jira to check reminders.</div>';
+    checkRemindersButton.disabled = false;
+    checkRemindersButton.textContent = 'Check Now';
+    return;
+  }
+
+  // Call background script to check reminders
+  chrome.runtime.sendMessage({
+    type: 'CHECK_REMINDERS'
+  }, function (response) {
+    checkRemindersButton.disabled = false;
+    checkRemindersButton.textContent = 'Check Now';
+    if (response.success) {
+      var data = response.data;
+      if (data.reminders && data.reminders.length > 0) {
+        // Show reminders
+        loadRecentReminders(data.reminders);
+      } else {
+        // No reminders
+        remindersList.innerHTML = '<div class="no-reminders">No reminders found.</div>';
+      }
+    } else {
+      // Error
+      remindersList.innerHTML = "<div class=\"error-message\">Failed to check reminders: ".concat(response.error, "</div>");
+    }
+  });
+}
+
+// Handle test reminder
+function handleTestReminder() {
+  // Show testing message
+  testReminderButton.disabled = true;
+  testReminderButton.textContent = 'Sending...';
+
+  // Check authentication
+  if (!isAuthenticated) {
+    alert('Please log in with Jira to test reminders.');
+    testReminderButton.disabled = false;
+    testReminderButton.textContent = 'Test Notification';
+    return;
+  }
+
+  // Create test reminder
+  var testMessage = "This is a test reminder created at ".concat(new Date().toLocaleTimeString());
+  chrome.runtime.sendMessage({
+    type: 'API_REQUEST',
+    endpoint: '/api/reminders/test',
+    method: 'POST',
+    data: {
+      message: testMessage
+    }
+  }, function (response) {
+    testReminderButton.disabled = false;
+    testReminderButton.textContent = 'Test Notification';
+    if (response.success) {
+      // Show the reminder
+      var reminder = response.data.reminder;
+
+      // Create notification
+      chrome.runtime.sendMessage({
+        type: 'SHOW_NOTIFICATION',
+        title: 'Test Reminder',
+        message: reminder.message,
+        actions: reminder.actions
+      });
+
+      // Refresh reminder list
+      loadRecentReminders([reminder]);
+    } else {
+      alert("Failed to create test reminder: ".concat(response.error));
+    }
+  });
+}
+
+// Save reminder settings
+function saveReminderSettings() {
+  chrome.storage.local.set({
+    notificationsEnabled: reminderToggle.checked
+  }, function () {
+    // Update notifications toggle to match
+    notificationsToggle.checked = reminderToggle.checked;
+  });
+}
+
+// Load recent reminders
+function loadRecentReminders() {
+  var reminders = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : null;
+  // Clear list
+  remindersList.innerHTML = '';
+
+  // If reminders provided, use them
+  if (reminders && reminders.length > 0) {
+    displayReminders(reminders);
+    return;
+  }
+
+  // Otherwise load from storage
+  chrome.storage.local.get('recentReminders', function (data) {
+    if (data.recentReminders && data.recentReminders.length > 0) {
+      displayReminders(data.recentReminders);
+    } else {
+      remindersList.innerHTML = '<div class="no-reminders">No recent reminders</div>';
+    }
+  });
+}
+
+// Display reminders in the UI
+function displayReminders(reminders) {
+  // Save to storage
+  chrome.storage.local.set({
+    recentReminders: reminders.slice(0, 10)
+  });
+
+  // Clear list
+  remindersList.innerHTML = '';
+
+  // Add reminders
+  reminders.forEach(function (reminder) {
+    var reminderItem = document.createElement('div');
+    reminderItem.className = "reminder-item urgency-".concat(reminder.urgency);
+
+    // Format timestamp
+    var timestamp = new Date(reminder.timestamp);
+    var formattedTime = timestamp.toLocaleString();
+    reminderItem.innerHTML = "\n      <div class=\"reminder-header\">\n        <span class=\"reminder-key\">".concat(reminder.key, "</span>\n        <span class=\"reminder-time\">").concat(formattedTime, "</span>\n      </div>\n      <div class=\"reminder-title\">").concat(reminder.title, "</div>\n      <div class=\"reminder-message\">").concat(reminder.message, "</div>\n      <div class=\"reminder-details\">\n        <span class=\"reminder-priority\">Priority: ").concat(reminder.priority, "</span>\n        <span class=\"reminder-status\">Status: ").concat(reminder.status, "</span>\n      </div>\n    ");
+    remindersList.appendChild(reminderItem);
   });
 }
 /******/ })()

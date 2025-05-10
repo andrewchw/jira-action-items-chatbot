@@ -12,11 +12,17 @@ const statusCircle = document.getElementById('status-circle');
 const statusText = document.getElementById('status-text');
 const tabChat = document.getElementById('tab-chat');
 const tabTasks = document.getElementById('tab-tasks');
+const tabReminders = document.getElementById('tab-reminders');
 const tabSettings = document.getElementById('tab-settings');
 const tasksContent = document.getElementById('tasks-content');
+const remindersContent = document.getElementById('reminders-content');
 const settingsContent = document.getElementById('settings-content');
 const serverUrlInput = document.getElementById('server-url');
 const notificationsToggle = document.getElementById('notifications-toggle');
+const reminderToggle = document.getElementById('reminder-toggle');
+const checkRemindersButton = document.getElementById('check-reminders-button');
+const testReminderButton = document.getElementById('test-reminder-button');
+const remindersList = document.getElementById('reminders-list');
 const saveSettingsButton = document.getElementById('save-settings');
 const taskList = document.getElementById('task-list');
 
@@ -108,6 +114,7 @@ function loadSettings() {
     
     if (data.notificationsEnabled !== undefined) {
       notificationsToggle.checked = data.notificationsEnabled;
+      reminderToggle.checked = data.notificationsEnabled;
     }
     
     isAuthenticated = data.isAuthenticated || false;
@@ -215,7 +222,7 @@ function checkServerConnection() {
   chrome.storage.local.get('serverUrl', (data) => {
     const serverUrl = data.serverUrl || 'http://localhost:8000';
     
-    fetch(`${serverUrl}/health`, { method: 'GET' })
+    fetch(`${serverUrl}/api/health`, { method: 'GET' })
       .then(response => {
         if (response.ok) {
           setStatus('connected');
@@ -402,7 +409,13 @@ function setupEventListeners() {
   // Tab buttons
   tabChat.addEventListener('click', () => switchTab(tabChat));
   tabTasks.addEventListener('click', () => switchTab(tabTasks));
+  tabReminders.addEventListener('click', () => switchTab(tabReminders));
   tabSettings.addEventListener('click', () => switchTab(tabSettings));
+  
+  // Reminder buttons
+  checkRemindersButton.addEventListener('click', handleCheckReminders);
+  testReminderButton.addEventListener('click', handleTestReminder);
+  reminderToggle.addEventListener('change', saveReminderSettings);
   
   // Save settings button
   saveSettingsButton.addEventListener('click', saveSettings);
@@ -455,7 +468,7 @@ function smartSuggestions() {
 // Switch between tabs
 function switchTab(tab) {
   // Remove active class from all tabs
-  [tabChat, tabTasks, tabSettings].forEach(t => t.classList.remove('active'));
+  [tabChat, tabTasks, tabReminders, tabSettings].forEach(t => t.classList.remove('active'));
   
   // Add active class to selected tab
   tab.classList.add('active');
@@ -463,6 +476,7 @@ function switchTab(tab) {
   // Hide all content
   chatMessages.parentNode.style.display = 'none';
   tasksContent.style.display = 'none';
+  remindersContent.style.display = 'none';
   settingsContent.style.display = 'none';
   
   // Show content based on selected tab
@@ -470,10 +484,13 @@ function switchTab(tab) {
     chatMessages.parentNode.style.display = 'flex';
     showSuggestions();
   } else if (tab === tabTasks) {
-    tasksContent.style.display = 'block';
+      tasksContent.style.display = 'block';
     loadTasks();
+  } else if (tab === tabReminders) {
+    remindersContent.style.display = 'block';
+    loadRecentReminders();
   } else if (tab === tabSettings) {
-    settingsContent.style.display = 'block';
+      settingsContent.style.display = 'block';
     updateAuthUI();
   }
 }
@@ -520,19 +537,19 @@ async function sendMessage() {
     };
     
     // Send to API
-    chrome.runtime.sendMessage({
-      type: 'API_REQUEST',
+      chrome.runtime.sendMessage({
+        type: 'API_REQUEST',
       endpoint: '/api/chat',
-      method: 'POST',
+        method: 'POST',
       data: messageData
     }, (response) => {
-      // Remove typing indicator
+        // Remove typing indicator
       typingIndicator.remove();
-      
+        
       if (response.success) {
         // Add bot response to UI
-        addMessage('bot', response.data.response);
-        
+          addMessage('bot', response.data.response);
+          
         // Handle actions if any
         if (response.data.actions) {
           handleActions(response.data.actions);
@@ -583,7 +600,7 @@ async function getCurrentTabInfo() {
       const projectMatch = url.match(projectKeyRegex);
       const projectKey = projectMatch ? projectMatch[1] : null;
       
-      resolve({
+            resolve({
         isJiraPage,
         issueKey,
         projectKey,
@@ -797,5 +814,159 @@ function handleAttachment() {
     
     // Here you would upload the file to the server
     // This requires additional implementation in the API
+  });
+}
+
+// Handle checking for reminders
+function handleCheckReminders() {
+  // Disable button while checking
+  checkRemindersButton.disabled = true;
+  checkRemindersButton.textContent = 'Checking...';
+  
+  // Show checking message
+  const loadingItem = document.createElement('div');
+  loadingItem.className = 'reminder-item loading';
+  loadingItem.innerHTML = '<div class="reminder-title">Checking for reminders...</div>';
+  remindersList.innerHTML = '';
+  remindersList.appendChild(loadingItem);
+  
+  // Check authentication
+  if (!isAuthenticated) {
+    remindersList.innerHTML = '<div class="no-reminders">Please log in with Jira to check reminders.</div>';
+    checkRemindersButton.disabled = false;
+    checkRemindersButton.textContent = 'Check Now';
+    return;
+  }
+  
+  // Call background script to check reminders
+  chrome.runtime.sendMessage({ type: 'CHECK_REMINDERS' }, (response) => {
+    checkRemindersButton.disabled = false;
+    checkRemindersButton.textContent = 'Check Now';
+    
+    if (response.success) {
+      const data = response.data;
+      
+      if (data.reminders && data.reminders.length > 0) {
+        // Show reminders
+        loadRecentReminders(data.reminders);
+      } else {
+        // No reminders
+        remindersList.innerHTML = '<div class="no-reminders">No reminders found.</div>';
+      }
+    } else {
+      // Error
+      remindersList.innerHTML = `<div class="error-message">Failed to check reminders: ${response.error}</div>`;
+    }
+  });
+}
+
+// Handle test reminder
+function handleTestReminder() {
+  // Show testing message
+  testReminderButton.disabled = true;
+  testReminderButton.textContent = 'Sending...';
+  
+  // Check authentication
+  if (!isAuthenticated) {
+    alert('Please log in with Jira to test reminders.');
+    testReminderButton.disabled = false;
+    testReminderButton.textContent = 'Test Notification';
+    return;
+  }
+  
+  // Create test reminder
+  const testMessage = `This is a test reminder created at ${new Date().toLocaleTimeString()}`;
+  
+  chrome.runtime.sendMessage({ 
+    type: 'API_REQUEST',
+    endpoint: '/api/reminders/test',
+    method: 'POST',
+    data: { message: testMessage }
+  }, (response) => {
+    testReminderButton.disabled = false;
+    testReminderButton.textContent = 'Test Notification';
+    
+    if (response.success) {
+      // Show the reminder
+      const reminder = response.data.reminder;
+      
+      // Create notification
+      chrome.runtime.sendMessage({
+        type: 'SHOW_NOTIFICATION',
+        title: 'Test Reminder',
+        message: reminder.message,
+        actions: reminder.actions
+      });
+      
+      // Refresh reminder list
+      loadRecentReminders([reminder]);
+    } else {
+      alert(`Failed to create test reminder: ${response.error}`);
+    }
+  });
+}
+
+// Save reminder settings
+function saveReminderSettings() {
+  chrome.storage.local.set({
+    notificationsEnabled: reminderToggle.checked
+  }, () => {
+    // Update notifications toggle to match
+    notificationsToggle.checked = reminderToggle.checked;
+  });
+}
+
+// Load recent reminders
+function loadRecentReminders(reminders = null) {
+  // Clear list
+  remindersList.innerHTML = '';
+  
+  // If reminders provided, use them
+  if (reminders && reminders.length > 0) {
+    displayReminders(reminders);
+    return;
+  }
+  
+  // Otherwise load from storage
+  chrome.storage.local.get('recentReminders', (data) => {
+    if (data.recentReminders && data.recentReminders.length > 0) {
+      displayReminders(data.recentReminders);
+    } else {
+      remindersList.innerHTML = '<div class="no-reminders">No recent reminders</div>';
+    }
+  });
+}
+
+// Display reminders in the UI
+function displayReminders(reminders) {
+  // Save to storage
+  chrome.storage.local.set({ recentReminders: reminders.slice(0, 10) });
+  
+  // Clear list
+  remindersList.innerHTML = '';
+  
+  // Add reminders
+  reminders.forEach(reminder => {
+    const reminderItem = document.createElement('div');
+    reminderItem.className = `reminder-item urgency-${reminder.urgency}`;
+    
+    // Format timestamp
+    const timestamp = new Date(reminder.timestamp);
+    const formattedTime = timestamp.toLocaleString();
+    
+    reminderItem.innerHTML = `
+      <div class="reminder-header">
+        <span class="reminder-key">${reminder.key}</span>
+        <span class="reminder-time">${formattedTime}</span>
+      </div>
+      <div class="reminder-title">${reminder.title}</div>
+      <div class="reminder-message">${reminder.message}</div>
+      <div class="reminder-details">
+        <span class="reminder-priority">Priority: ${reminder.priority}</span>
+        <span class="reminder-status">Status: ${reminder.status}</span>
+      </div>
+    `;
+    
+    remindersList.appendChild(reminderItem);
   });
 } 

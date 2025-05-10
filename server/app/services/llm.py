@@ -181,20 +181,43 @@ class OpenRouterClient:
                 # Parse the JSON response
                 result = response.json()
                 
+                # Verify the response contains the expected data
+                if "choices" not in result or not result["choices"]:
+                    logger.error(f"Invalid response from OpenRouter API: missing 'choices' field: {result}")
+                    # Create a fallback response
+                    fallback_response = {
+                        "id": f"fallback_{int(time.time())}",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "I'm sorry, but I encountered an issue processing your request. Could you please try again or rephrase your question?"
+                                },
+                                "index": 0,
+                                "finish_reason": "error"
+                            }
+                        ],
+                        "usage": {"total_tokens": 0}
+                    }
+                    result = fallback_response
+                
                 # Cache the successful response if caching is enabled
                 if use_cache:
-                    # Extract the text response
-                    text_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    # Get tokens used if available
-                    tokens_used = result.get("usage", {}).get("total_tokens", 0)
-                    # Save to cache
-                    self._save_to_cache(
-                        model=model,
-                        messages=messages,
-                        response=json.dumps(result),
-                        tokens_used=tokens_used,
-                        ttl_hours=cache_ttl_hours
-                    )
+                    try:
+                        # Extract the text response
+                        text_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        # Get tokens used if available
+                        tokens_used = result.get("usage", {}).get("total_tokens", 0)
+                        # Save to cache
+                        self._save_to_cache(
+                            model=model,
+                            messages=messages,
+                            response=json.dumps(result),
+                            tokens_used=tokens_used,
+                            ttl_hours=cache_ttl_hours
+                        )
+                    except Exception as e:
+                        logger.error(f"Error caching response: {str(e)}")
                 
                 return result
                 
@@ -260,7 +283,7 @@ class OpenRouterClient:
         
         # Return the limit for the model or the default if not found
         return model_limits.get(base_model, model_limits["default"])
-
+    
     async def generate_text(self, prompt: str, **kwargs) -> str:
         """
         Simple wrapper to generate text from a prompt.

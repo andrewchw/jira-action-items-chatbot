@@ -38,6 +38,7 @@
     <div class="tabs">
       <button id="tab-chat" class="tab-button active">Chat</button>
       <button id="tab-tasks" class="tab-button">My Tasks</button>
+      <button id="tab-reminders" class="tab-button">Reminders</button>
       <button id="tab-settings" class="tab-button">Settings</button>
     </div>
     
@@ -45,6 +46,30 @@
     <div id="tasks-content" class="tab-content" style="display: none;">
       <div class="task-list" id="task-list">
         <div class="loading-indicator">Loading tasks...</div>
+      </div>
+    </div>
+    
+    <!-- Reminders Tab Content (hidden by default) -->
+    <div id="reminders-content" class="tab-content" style="display: none;">
+      <div class="reminders-settings">
+        <div class="settings-group">
+          <label>Reminder Notifications</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="reminder-toggle" checked>
+            <span class="slider"></span>
+          </label>
+          <span>Enabled</span>
+        </div>
+        <div class="reminders-actions">
+          <button id="check-reminders-button" class="secondary-button">Check Now</button>
+          <button id="test-reminder-button" class="secondary-button">Test Notification</button>
+        </div>
+      </div>
+      <div class="reminders-history">
+        <h3>Recent Reminders</h3>
+        <div id="reminders-list" class="reminders-list">
+          <div class="no-reminders">No recent reminders</div>
+        </div>
       </div>
     </div>
     
