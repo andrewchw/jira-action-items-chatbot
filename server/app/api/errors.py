@@ -3,6 +3,9 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from typing import Any, Dict, Optional
 import logging
+import traceback
+import json
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -83,30 +86,40 @@ class ValidationError(APIError):
 
 
 # Exception handlers
-async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
-    """Handler for custom API exceptions"""
-    error_response = {
-        "detail": exc.detail,
-        "type": exc.__class__.__name__,
-    }
+async def log_exception(request: Request, exc: Exception) -> None:
+    """
+    Log exception details including request information
+    """
+    # Get request details
+    method = request.method
+    url = str(request.url)
     
-    if exc.error_code:
-        error_response["code"] = exc.error_code
+    # Get client information
+    client_host = request.client.host if request.client else "unknown"
     
-    # Log the error with context
+    # Format traceback
+    tb = traceback.format_exc()
+    
+    # Log the error with all available context
     logger.error(
-        f"API Error: {exc.__class__.__name__} - {exc.detail}",
+        f"Exception during {method} {url} from {client_host}: {str(exc)}\n{tb}",
         extra={
-            "status_code": exc.status_code,
-            "method": request.method,
-            "url": str(request.url),
-            "client_host": request.client.host if request.client else None,
+            "method": method,
+            "url": url,
+            "client_host": client_host,
+            "exception_type": type(exc).__name__,
+            "exception_detail": str(exc),
         }
     )
-    
+
+async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
+    """
+    Handle API errors with custom status code and detail
+    """
+    await log_exception(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
-        content=error_response,
+        content={"detail": exc.detail},
         headers=exc.headers
     )
 
@@ -136,27 +149,53 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     )
 
 
-async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Handler for unhandled exceptions"""
-    error_message = f"Internal server error: {str(exc)}"
-    error_response = {
-        "detail": error_message,
-        "type": exc.__class__.__name__,
-    }
+async def requests_exception_handler(request: Request, exc: requests.RequestException) -> JSONResponse:
+    """
+    Handle exceptions from the requests library (used in OAuth flows)
+    """
+    await log_exception(request, exc)
     
-    # Log the error with context and traceback
-    logger.exception(
-        f"Unhandled Exception: {str(exc)}",
-        extra={
-            "method": request.method,
-            "url": str(request.url),
-            "client_host": request.client.host if request.client else None,
-        }
-    )
+    # Try to extract response info if available
+    status_code = getattr(exc.response, 'status_code', 500) if hasattr(exc, 'response') else 500
+    
+    # Try to get response content
+    try:
+        if hasattr(exc, 'response') and exc.response is not None:
+            content = exc.response.json()
+            detail = f"External API error: {json.dumps(content)}"
+        else:
+            detail = f"External API error: {str(exc)}"
+    except (ValueError, AttributeError):
+        if hasattr(exc, 'response') and exc.response is not None:
+            detail = f"External API error: {exc.response.text}"
+        else:
+            detail = f"External API error: {str(exc)}"
     
     return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail}
+    )
+
+
+async def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Handle validation errors
+    """
+    await log_exception(request, exc)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": str(exc)}
+    )
+
+
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Generic handler for all unhandled exceptions
+    """
+    await log_exception(request, exc)
+    return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=error_response
+        content={"detail": "An unexpected error occurred. Please try again later."}
     )
 
 
@@ -165,4 +204,7 @@ def register_exception_handlers(app):
     """Register all exception handlers with the FastAPI application"""
     app.add_exception_handler(APIError, api_error_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
-    app.add_exception_handler(Exception, general_exception_handler) 
+    app.add_exception_handler(requests.RequestException, requests_exception_handler)
+    app.add_exception_handler(Exception, generic_exception_handler)
+    
+    logger.info("Exception handlers registered successfully") 

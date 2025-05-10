@@ -215,6 +215,52 @@ class OpenRouterClient:
                 # Increase delay for next attempt
                 current_delay *= 2
     
+    def get_max_token_limit(self, model: Optional[str] = None) -> int:
+        """
+        Get the maximum token limit for the specified model or the default model.
+        
+        Note: While many OpenRouter models support larger context windows (8K-128K tokens),
+        some applications and tools artificially limit max_tokens to 1024 tokens.
+        This is not an OpenRouter limitation but a client-side restriction
+        that we're working around by setting higher limits here.
+        
+        Args:
+            model: The model to get the token limit for (defaults to self.default_model)
+            
+        Returns:
+            The maximum token limit for the model
+        """
+        # Use default model if none provided
+        if not model:
+            model = self.default_model
+            
+        # Map models to their known context limits
+        # Most newer models support at least 8K context windows
+        model_limits = {
+            # Meta/Llama models
+            "meta-llama/llama-3-70b-instruct": 8192,
+            "meta-llama/llama-3-8b-instruct": 8192,
+            # Mistral models
+            "mistralai/mistral-7b-instruct": 8192,
+            "mistralai/mistral-large-latest": 32768,
+            # Claude models accessed via OpenRouter
+            "anthropic/claude-3-opus": 128000,
+            "anthropic/claude-3-sonnet": 128000,
+            "anthropic/claude-3-haiku": 48000,
+            # OpenAI models accessed via OpenRouter
+            "openai/gpt-4-turbo": 128000,
+            "openai/gpt-4": 8192,
+            "openai/gpt-3.5-turbo": 16384,
+            # Default for any model not explicitly listed
+            "default": 4096
+        }
+        
+        # Remove any variant suffixes like :free, :online, etc.
+        base_model = model.split(":")[0] if ":" in model else model
+        
+        # Return the limit for the model or the default if not found
+        return model_limits.get(base_model, model_limits["default"])
+
     async def generate_text(self, prompt: str, **kwargs) -> str:
         """
         Simple wrapper to generate text from a prompt.
@@ -230,6 +276,11 @@ class OpenRouterClient:
         # Construct a simple user message
         messages = [{"role": "user", "content": prompt}]
         
+        # Set max_tokens to model limit if not provided
+        if "max_tokens" not in kwargs:
+            model = kwargs.get("model", self.default_model)
+            kwargs["max_tokens"] = min(settings.LLM_MAX_TOKENS, self.get_max_token_limit(model))
+        
         # Send the request
         response = await self.chat_completion(messages=messages, **kwargs)
         
@@ -243,7 +294,7 @@ class OpenRouterClient:
     async def fallback_response(self, prompt: str) -> str:
         """
         Generate a fallback response when the API is not available.
-        Provides basic responses for common scenarios.
+        Provides context-aware responses for common scenarios.
         
         Args:
             prompt: The user's prompt
@@ -254,31 +305,142 @@ class OpenRouterClient:
         # Check for common task-related queries
         prompt_lower = prompt.lower()
         
-        if "jira" in prompt_lower or "task" in prompt_lower or "issue" in prompt_lower:
+        # Jira-specific fallback responses
+        if any(word in prompt_lower for word in ["jira", "task", "issue", "ticket", "story"]):
+            if any(action in prompt_lower for action in ["create", "add", "new", "make"]):
+                return (
+                    "I'm currently having trouble connecting to the Jira API to create a new task. "
+                    "You can try these alternatives:\n"
+                    "1. Try again in a few minutes\n"
+                    "2. Create the task directly in Jira\n"
+                    "3. Provide more details about the task you want to create so I can help when the connection is restored"
+                )
+            
+            if any(action in prompt_lower for action in ["update", "change", "edit", "modify"]):
+                return (
+                    "I'm currently having trouble connecting to the Jira API to update tasks. "
+                    "Please try again later or make the changes directly in your Jira instance."
+                )
+            
+            if any(action in prompt_lower for action in ["list", "show", "get", "find", "what", "search"]):
+                return (
+                    "I'm unable to retrieve Jira tasks at the moment due to connection issues. "
+                    "Please try again later or check your Jira dashboard directly."
+                )
+                
+            # Generic Jira fallback
             return (
                 "I'm sorry, but I'm currently having trouble connecting to the Jira API. "
-                "Please try again later or check your Jira directly at your organization's Jira URL."
+                "Please try again later or access Jira directly at your organization's Jira URL."
             )
         
-        if "reminder" in prompt_lower or "remind" in prompt_lower:
+        # Reminder-specific fallbacks
+        if any(word in prompt_lower for word in ["reminder", "remind", "alert", "notify"]):
+            if any(action in prompt_lower for action in ["create", "add", "new", "set"]):
+                return (
+                    "I'm currently having trouble setting up reminders. "
+                    "As an alternative, you could set a reminder in your calendar app or try again later."
+                )
+                
+            if any(action in prompt_lower for action in ["list", "show", "get"]):
+                return (
+                    "I'm unable to retrieve your reminders at the moment. "
+                    "Please try again later or check any existing reminders in your notification center."
+                )
+                
+            # Generic reminder fallback
             return (
-                "I'm sorry, but I'm currently having trouble processing reminder requests. "
-                "Please try again later or set a reminder manually."
+                "I'm sorry, but I'm currently having trouble with the reminder system. "
+                "Please try again later or use your calendar app for time-sensitive reminders."
             )
             
-        if any(help_word in prompt_lower for help_word in ["help", "how", "can you", "what can"]):
+        # Help-related fallbacks    
+        if any(help_word in prompt_lower for help_word in ["help", "how", "can you", "what can", "guide"]):
             return (
                 "I can help you manage Jira action items through natural language commands. "
                 "I can create tasks, update them, add comments, set reminders, and track evidence. "
+                "Some examples of what you can ask:\n\n"
+                "• \"Create a new bug in the PROJ project about login issues\"\n"
+                "• \"Show my open tasks\"\n"
+                "• \"What's the status of PROJ-123?\"\n"
+                "• \"Remind me about PROJ-456 tomorrow at 2pm\"\n\n"
                 "However, I'm experiencing connection issues at the moment. Please try again later."
             )
+            
+        # Authentication/permission fallbacks
+        if any(word in prompt_lower for word in ["login", "auth", "permission", "access", "token"]):
+            return (
+                "I'm experiencing authentication issues with the Jira API. "
+                "This could be due to expired credentials or permission changes. "
+                "Please verify your Jira credentials in the extension settings or contact your administrator."
+            )
         
-        # Generic fallback
+        # Check for specific error patterns that might need specialized responses
+        if "rate limit" in prompt_lower or "too many requests" in prompt_lower:
+            return (
+                "The Jira API is currently rate-limited due to high traffic. "
+                "Please wait a few minutes before trying again."
+            )
+            
+        # Generic fallback with instructions for better results
         return (
             "I'm sorry, but I'm having trouble processing your request right now. "
             "This could be due to connectivity issues or temporary service disruption. "
-            "Please try again later."
+            "Please try again later with a clear, specific request about Jira tasks or reminders."
         )
+
+    # Add method for standardizing response formats
+    async def format_response(self, response_data: Dict, intent: str = None) -> str:
+        """
+        Format the LLM response based on intent and data structure.
+        
+        Args:
+            response_data: The raw response data
+            intent: The user's detected intent (optional)
+            
+        Returns:
+            Formatted response string
+        """
+        try:
+            # Extract the text response
+            if "choices" in response_data and response_data["choices"]:
+                raw_response = response_data["choices"][0]["message"]["content"]
+            else:
+                return "I couldn't generate a proper response. Please try again."
+            
+            # Process based on intent if provided
+            if intent:
+                if intent == "get_tasks" or intent == "get_my_tasks":
+                    # Clean up formatting for task lists
+                    # Remove markdown list markers that might be inconsistent
+                    lines = raw_response.split('\n')
+                    formatted_lines = []
+                    
+                    for line in lines:
+                        # Remove markdown list markers and standardize
+                        clean_line = line.strip()
+                        if clean_line.startswith('- ') or clean_line.startswith('* '):
+                            clean_line = '• ' + clean_line[2:]
+                        elif clean_line.startswith('1. ') or clean_line.startswith('1) '):
+                            clean_line = '• ' + clean_line[3:]
+                        formatted_lines.append(clean_line)
+                    
+                    return '\n'.join(formatted_lines)
+                
+                elif intent == "get_task_details":
+                    # Remove any code blocks or excessive formatting
+                    return raw_response.replace('```', '').replace('`', '')
+                    
+                # Add more intent-specific formatting as needed
+            
+            # Default: clean up common formatting issues
+            cleaned_response = raw_response.replace('```', '').strip()
+            return cleaned_response
+            
+        except Exception as e:
+            logger.error(f"Error formatting response: {str(e)}")
+            return response_data.get("choices", [{}])[0].get("message", {}).get("content", 
+                "I couldn't format the response properly. Please try again.")
 
 class JiraPrompts:
     """
@@ -373,6 +535,35 @@ class JiraPrompts:
     - Relates it to the task requirements
     - Provides any necessary context about the evidence
     - Suggests next steps based on this evidence
+    """
+
+    # Add a more specialized template for task formatting
+    TASK_FORMATTING = """
+    Format the following Jira task data into a clear, human-friendly summary:
+    
+    ```json
+    {task_data}
+    ```
+    
+    Present the information in a structured way that highlights:
+    1. The task title, ID and status
+    2. Key details like assignee, priority, and due date
+    3. A concise summary of the description
+    4. Essential information from any comments or attachments
+    
+    Use bullet points for clarity and keep the formatting consistent.
+    """
+    
+    # Add template for error handling
+    ERROR_HANDLING = """
+    The user requested information about Jira tasks, but we encountered this error:
+    
+    {error_message}
+    
+    Provide a helpful, empathetic response that:
+    1. Acknowledges the error without technical details
+    2. Suggests alternative actions the user can take
+    3. Offers troubleshooting advice if appropriate
     """
 
 class LLMService:
@@ -592,6 +783,67 @@ class LLMService:
         
         response = await self.chat_completion(messages=messages)
         return response["choices"][0]["message"]["content"]
+
+    async def format_jira_response(self, jira_data: Dict, intent: str) -> str:
+        """
+        Format Jira API response data into a human-readable format.
+        
+        Args:
+            jira_data: The raw Jira API response
+            intent: The user's intent
+            
+        Returns:
+            Formatted string for human consumption
+        """
+        try:
+            # Create a prompt based on the intent and data
+            if intent == "get_task_details":
+                prompt = JiraPrompts.TASK_DETAIL.format(
+                    task_details=json.dumps(jira_data)
+                )
+            elif intent in ["get_tasks", "get_my_tasks"]:
+                prompt = JiraPrompts.TASK_QUERY.format(
+                    jql_results=json.dumps(jira_data)
+                )
+            else:
+                # For other intents, use a generic formatting
+                prompt = f"Format this Jira data for a {intent} request: {json.dumps(jira_data)}"
+            
+            # Get LLM to format the data
+            messages = [
+                {"role": "system", "content": "You are an expert at formatting Jira data into clear, concise summaries."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            # Use lower temperature for more consistent formatting
+            response = await self.chat_completion(messages=messages, temperature=0.3)
+            return response["choices"][0]["message"]["content"]
+            
+        except Exception as e:
+            logger.error(f"Error formatting Jira response: {str(e)}")
+            # Provide a basic formatting as fallback
+            if intent == "get_task_details" and "fields" in jira_data:
+                fields = jira_data["fields"]
+                return (
+                    f"Task: {jira_data.get('key', 'Unknown')}\n"
+                    f"Summary: {fields.get('summary', 'No summary')}\n"
+                    f"Status: {fields.get('status', {}).get('name', 'Unknown')}\n"
+                    f"Assignee: {fields.get('assignee', {}).get('displayName', 'Unassigned')}\n"
+                    f"Description: {fields.get('description', 'No description')[:100]}..."
+                )
+            elif intent in ["get_tasks", "get_my_tasks"] and "issues" in jira_data:
+                # Format a basic list of issues
+                response = "Task List:\n"
+                for issue in jira_data["issues"][:5]:  # Limit to first 5
+                    fields = issue.get("fields", {})
+                    response += (
+                        f"• {issue.get('key', 'Unknown')}: {fields.get('summary', 'No summary')} "
+                        f"({fields.get('status', {}).get('name', 'Unknown')})\n"
+                    )
+                return response
+            
+            # Generic fallback
+            return f"Jira data retrieved successfully. Use specific commands to see details."
 
 # Initialize and export the LLM service
 llm_service = LLMService() 

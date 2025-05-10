@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import app modules after path fix
 from app.api import endpoints
+from app.api import auth  # Import the auth module
 from app.core.config import settings, get_settings
 from app.services.memory import memory_service
 from app.models.database import db_manager
@@ -83,8 +84,15 @@ def create_application() -> FastAPI:
         tags=["api"],
     )
     
+    # Include authentication endpoints
+    application.include_router(
+        auth.router,
+        prefix="/api/auth",
+        tags=["auth"],
+    )
+    
     # Define startup and shutdown events
-    @application.on_startup
+    @application.on_event("startup")
     async def startup_event():
         """
         Initialize services on startup
@@ -118,7 +126,7 @@ def create_application() -> FastAPI:
             logger.warning("Starting with limited functionality (memory service unavailable)")
             # If memory service fails, the app can still run with limited functionality
 
-    @application.on_shutdown
+    @application.on_event("shutdown")
     async def shutdown_event():
         """
         Clean up resources on shutdown
@@ -169,7 +177,7 @@ if __name__ == "__main__":
     import uvicorn
     
     # Get port from environment or use default
-    port = int(os.environ.get("PORT", settings.PORT))
+    port = int(os.environ.get("PORT", settings.API_PORT))
     
     # Run the FastAPI app with uvicorn
     uvicorn.run(

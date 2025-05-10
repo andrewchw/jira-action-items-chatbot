@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from typing import Dict, List, Optional, Any
 import logging
 import json
@@ -6,18 +6,50 @@ import os
 from datetime import datetime, timedelta
 from app.services.memory import memory_service
 from app.models.database import get_db, create_reminder, get_pending_reminders, JiraCache, Reminder, UserConfig
-from app.models.schemas import ReminderRequest, ReminderResponse, ReminderList, ChatMessage, ChatResponse
+from app.models.schemas import ReminderRequest, ReminderResponse, ReminderList, ChatMessage, ChatResponse, ReminderModel, ReminderActionResponse
 from app.services.llm import llm_service
 from app.services.prompts import prompt_manager
 from app.services.jira import JiraClient
 from app.core.config import settings
 from sqlalchemy.orm import Session
+import hashlib
+from app.api.auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Initialize the Jira client
 jira_client = JiraClient()
+
+# Helper function to get a Jira client (either OAuth or basic auth)
+def get_jira_client(request = None, db = None):
+    """
+    Get a Jira client using OAuth token if available, otherwise fallback to basic auth.
+    
+    Args:
+        request: FastAPI request object (for extracting user from cookies)
+        db: Database session
+        
+    Returns:
+        JiraClient instance
+    """
+    if request and db:
+        # Try to get user ID from cookie
+        user_id = request.cookies.get("jira_user_id")
+        
+        if user_id:
+            # Create OAuth client
+            client = JiraClient(use_oauth=True, user_id=user_id)
+            
+            # Try to load OAuth token
+            if client.load_oauth_token(db):
+                logger.info(f"Using OAuth for user {user_id}")
+                return client
+                
+            logger.info(f"OAuth token not available for user {user_id}, falling back to basic auth")
+    
+    # Fall back to basic auth client
+    return jira_client
 
 @router.get("/health")
 async def health_check() -> Dict[str, str]:
@@ -62,9 +94,12 @@ async def memory_service_status() -> Dict[str, Any]:
 
 @router.get("/jira/tasks")
 async def get_jira_tasks(
+    request: Request,
     jql: str = "assignee = currentUser() ORDER BY updated DESC",
     max_results: int = 50,
-    fields: Optional[str] = None
+    fields: Optional[str] = None,
+    use_cache: bool = True,
+    db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """
     Get Jira tasks using JQL query.
@@ -73,34 +108,95 @@ async def get_jira_tasks(
         jql: JQL query string (default: tasks assigned to current user)
         max_results: Maximum number of results to return
         fields: Comma-separated list of fields to include
+        use_cache: Whether to use cached results
     """
     try:
+        # Get Jira client with OAuth if available
+        client = get_jira_client(request, db)
+        
         # Convert fields string to list if provided
         fields_list = fields.split(",") if fields else None
         
         # Call the Jira API
-        result = jira_client.search_issues(
+        result = client.search_issues(
             jql=jql,
             fields=fields_list,
-            max_results=max_results
+            max_results=max_results,
+            use_cache=use_cache
         )
         
-        # Cache the result in the database for offline access
-        # TODO: Implement caching logic
+        # Map Jira fields to natural language entities for better presentation
+        if "issues" in result:
+            for i, issue in enumerate(result["issues"]):
+                result["issues"][i]["entities"] = client.map_jira_to_nl_entities(issue)
         
         return result
     except Exception as e:
         logger.error(f"Error fetching Jira tasks: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Jira tasks: {str(e)}")
 
-@router.get("/jira/task/{issue_key}")
-async def get_jira_task(issue_key: str, fields: Optional[str] = None) -> Dict[str, Any]:
+@router.post("/jira/tasks")
+async def create_jira_task(
+    request: Request,
+    task: Dict[str, Any],
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Create a new Jira task.
+    
+    Args:
+        task: Task details including project, type, summary, etc.
+    """
+    try:
+        # Get Jira client with OAuth if available
+        client = get_jira_client(request, db)
+        
+        # Extract required fields
+        project_key = task.get("project_key")
+        if not project_key:
+            raise HTTPException(status_code=400, detail="Project key is required")
+        
+        issue_type = task.get("issue_type", "Task")
+        summary = task.get("summary")
+        if not summary:
+            raise HTTPException(status_code=400, detail="Summary is required")
+        
+        description = task.get("description", "")
+        
+        # Extract additional fields
+        additional_fields = {}
+        for key, value in task.items():
+            if key not in ["project_key", "issue_type", "summary", "description"]:
+                additional_fields[key] = value
+        
+        # Create the issue
+        result = client.create_issue(
+            project_key=project_key,
+            issue_type=issue_type,
+            summary=summary,
+            description=description,
+            additional_fields=additional_fields
+        )
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error creating Jira task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create Jira task: {str(e)}")
+
+@router.get("/jira/tasks/{issue_key}")
+async def get_jira_task(
+    issue_key: str,
+    fields: Optional[str] = None,
+    use_cache: bool = True,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
     """
     Get details for a specific Jira task.
     
     Args:
-        issue_key: The Jira issue key (e.g., PROJ-123)
+        issue_key: The issue key (e.g., 'PROJECT-123')
         fields: Comma-separated list of fields to include
+        use_cache: Whether to use cached results
     """
     try:
         # Convert fields string to list if provided
@@ -112,89 +208,70 @@ async def get_jira_task(issue_key: str, fields: Optional[str] = None) -> Dict[st
             fields=fields_list
         )
         
+        # Add natural language entities
+        result["entities"] = jira_client.map_jira_to_nl_entities(result)
+        
         return result
     except Exception as e:
         logger.error(f"Error fetching Jira task {issue_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Jira task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Jira task {issue_key}: {str(e)}")
 
-@router.post("/jira/task")
-async def create_jira_task(task_data: Dict[str, Any]) -> Dict[str, Any]:
+@router.put("/jira/tasks/{issue_key}")
+async def update_jira_task(
+    issue_key: str,
+    updates: Dict[str, Any],
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
     """
-    Create a new Jira task.
+    Update a Jira task.
     
     Args:
-        task_data: Dictionary containing task details
-            - project_key: Project key
-            - issue_type: Issue type
-            - summary: Task summary
-            - description: Task description
-            - additional_fields: Additional fields to set
+        issue_key: The issue key (e.g., 'PROJECT-123')
+        updates: Fields to update
     """
     try:
-        # Extract required fields
-        project_key = task_data.pop("project_key")
-        issue_type = task_data.pop("issue_type", "Task")
-        summary = task_data.pop("summary")
-        description = task_data.pop("description", None)
+        # Map natural language entities to Jira fields if provided
+        if "entities" in updates:
+            jira_fields = jira_client.map_nl_to_jira_fields(updates["entities"])
+            updates = jira_fields
         
-        # Call the Jira API
-        result = jira_client.create_issue(
-            project_key=project_key,
-            issue_type=issue_type,
-            summary=summary,
-            description=description,
-            additional_fields=task_data.get("additional_fields", {})
-        )
-        
-        return result
-    except KeyError as e:
-        logger.error(f"Missing required field for Jira task creation: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error creating Jira task: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create Jira task: {str(e)}")
-
-@router.put("/jira/task/{issue_key}")
-async def update_jira_task(issue_key: str, fields: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Update an existing Jira task.
-    
-    Args:
-        issue_key: The Jira issue key (e.g., PROJ-123)
-        fields: Dictionary of fields to update
-    """
-    try:
-        # Call the Jira API
+        # Update the issue
         result = jira_client.update_issue(
             issue_key=issue_key,
-            fields=fields
+            fields=updates
         )
         
-        return result
+        # Get updated issue
+        updated_issue = jira_client.get_issue(issue_key=issue_key)
+        
+        return updated_issue
     except Exception as e:
         logger.error(f"Error updating Jira task {issue_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to update Jira task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update Jira task {issue_key}: {str(e)}")
 
-@router.post("/jira/task/{issue_key}/comment")
-async def add_comment_to_task(issue_key: str, data: Dict[str, Any]) -> Dict[str, Any]:
+@router.post("/jira/tasks/{issue_key}/comment")
+async def add_jira_comment(
+    issue_key: str,
+    comment_data: Dict[str, Any],
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
     """
     Add a comment to a Jira task.
     
     Args:
-        issue_key: The Jira issue key
-        data:
-            - comment: Comment text
-            - visibility: Optional visibility restrictions
+        issue_key: The issue key (e.g., 'PROJECT-123')
+        comment_data: Comment details including body and visibility
     """
     try:
-        # Extract required fields
-        comment = data.get("comment")
-        visibility = data.get("visibility")
-        
+        # Extract comment body
+        comment = comment_data.get("body")
         if not comment:
-            raise HTTPException(status_code=400, detail="Comment text is required")
+            raise HTTPException(status_code=400, detail="Comment body is required")
         
-        # Call the Jira API
+        # Extract visibility if provided
+        visibility = comment_data.get("visibility")
+        
+        # Add the comment
         result = jira_client.add_comment(
             issue_key=issue_key,
             comment=comment,
@@ -204,30 +281,49 @@ async def add_comment_to_task(issue_key: str, data: Dict[str, Any]) -> Dict[str,
         return result
     except Exception as e:
         logger.error(f"Error adding comment to Jira task {issue_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to add comment: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to add comment to Jira task {issue_key}: {str(e)}")
 
-@router.post("/jira/task/{issue_key}/transition")
-async def transition_task(issue_key: str, data: Dict[str, Any]) -> Dict[str, Any]:
+@router.post("/jira/tasks/{issue_key}/transition")
+async def transition_jira_task(
+    issue_key: str,
+    transition_data: Dict[str, Any],
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
     """
     Transition a Jira task to a new status.
     
     Args:
-        issue_key: The Jira issue key
-        data:
-            - transition_id: ID of the transition to perform
-            - comment: Optional comment to add
-            - fields: Optional fields to update during transition
+        issue_key: The issue key (e.g., 'PROJECT-123')
+        transition_data: Transition details including ID, comment, and fields
     """
     try:
-        # Extract required fields
-        transition_id = data.get("transition_id")
-        comment = data.get("comment")
-        fields = data.get("fields")
-        
+        # Extract transition ID
+        transition_id = transition_data.get("id")
         if not transition_id:
-            raise HTTPException(status_code=400, detail="Transition ID is required")
+            # Try to get transition by name
+            transition_name = transition_data.get("name")
+            if not transition_name:
+                raise HTTPException(status_code=400, detail="Transition ID or name is required")
+            
+            # Get available transitions
+            transitions = jira_client.get_issue_transitions(issue_key)
+            
+            # Find transition by name
+            for transition in transitions.get("transitions", []):
+                if transition["name"].lower() == transition_name.lower():
+                    transition_id = transition["id"]
+                    break
+            
+            if not transition_id:
+                raise HTTPException(status_code=400, detail=f"Transition '{transition_name}' not found")
         
-        # Call the Jira API
+        # Extract comment if provided
+        comment = transition_data.get("comment")
+        
+        # Extract fields if provided
+        fields = transition_data.get("fields")
+        
+        # Transition the issue
         result = jira_client.transition_issue(
             issue_key=issue_key,
             transition_id=transition_id,
@@ -235,40 +331,24 @@ async def transition_task(issue_key: str, data: Dict[str, Any]) -> Dict[str, Any
             fields=fields
         )
         
-        return result
+        # Get updated issue
+        updated_issue = jira_client.get_issue(issue_key=issue_key)
+        
+        return updated_issue
     except Exception as e:
         logger.error(f"Error transitioning Jira task {issue_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to transition task: {str(e)}")
-
-@router.post("/jira/task/{issue_key}/assign")
-async def assign_task(issue_key: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Assign a Jira task to a user.
-    
-    Args:
-        issue_key: The Jira issue key
-        data:
-            - assignee: Username to assign to (or null to unassign)
-    """
-    try:
-        # Extract assignee
-        assignee = data.get("assignee")
-        
-        # Call the Jira API
-        result = jira_client.assign_issue(
-            issue_key=issue_key,
-            assignee=assignee
-        )
-        
-        return result
-    except Exception as e:
-        logger.error(f"Error assigning Jira task {issue_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to assign task: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to transition Jira task {issue_key}: {str(e)}")
 
 @router.get("/jira/projects")
-async def get_projects() -> List[Dict]:
+async def get_jira_projects(
+    use_cache: bool = True,
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
     """
-    Get all available Jira projects.
+    Get all Jira projects.
+    
+    Args:
+        use_cache: Whether to use cached results
     """
     try:
         # Call the Jira API
@@ -277,7 +357,65 @@ async def get_projects() -> List[Dict]:
         return result
     except Exception as e:
         logger.error(f"Error fetching Jira projects: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch projects: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Jira projects: {str(e)}")
+
+@router.get("/jira/issue-types")
+async def get_jira_issue_types(
+    use_cache: bool = True,
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
+    """
+    Get all Jira issue types.
+    
+    Args:
+        use_cache: Whether to use cached results
+    """
+    try:
+        # Call the Jira API
+        result = jira_client.get_issue_types()
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching Jira issue types: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Jira issue types: {str(e)}")
+
+@router.post("/jira/extract")
+async def extract_jira_entities(
+    text_data: Dict[str, str],
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Extract Jira entities from text using NLP processing.
+    
+    Args:
+        text_data: Text to process
+    """
+    try:
+        # Extract text
+        text = text_data.get("text")
+        if not text:
+            raise HTTPException(status_code=400, detail="Text is required")
+        
+        # Extract Jira issue key if present
+        issue_key = jira_client.extract_issue_key_from_text(text)
+        
+        # Extract project key if present
+        project_key = jira_client.extract_project_key_from_text(text)
+        
+        # Use LLM to extract other entities
+        entities = prompt_manager.extract_jira_entities(text)
+        
+        # Add extracted keys
+        if issue_key:
+            entities["issue_key"] = issue_key
+        
+        if project_key:
+            entities["project_key"] = project_key
+        
+        return {"entities": entities}
+    except Exception as e:
+        logger.error(f"Error extracting Jira entities: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract Jira entities: {str(e)}")
 
 @router.post("/chat", response_model=ChatResponse)
 async def process_chat_message(message: ChatMessage, db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -285,6 +423,9 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
     Process a chat message from the extension, using LLM to generate a response.
     """
     try:
+        start_time = datetime.now()
+        logger.info(f"Processing chat message: {message.text[:50]}...")
+        
         # Process the user's message to determine intent and extract entities
         processed = prompt_manager.process_user_input(message.text)
         intent = processed["intent"]
@@ -319,50 +460,76 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             context_message = {"role": "system", "content": f"Additional context: {json.dumps(message.context)}"}
             messages.insert(1, context_message)  # Insert after system prompt but before user message
         
-        # Check if intent requires Jira API interaction
-        jira_data = None
-        try:
-            if intent == "get_tasks" or intent == "get_my_tasks":
-                # Construct JQL based on the entities
-                jql = "assignee = currentUser()"
-                
-                if "status" in entities:
-                    jql += f" AND status = '{entities['status']}'"
-                    
-                if "priority" in entities:
-                    jql += f" AND priority = '{entities['priority']}'"
-                    
-                if "project_key" in entities:
-                    jql += f" AND project = {entities['project_key']}"
-                    
-                jql += " ORDER BY updated DESC"
-                
-                # Get tasks from Jira
-                jira_data = jira_client.search_issues(jql=jql, max_results=10)
-                
-                # Add task data to the messages as system context
-                if jira_data and "issues" in jira_data:
-                    jira_context = {"role": "system", "content": f"Current Jira tasks: {json.dumps(jira_data['issues'][:5])}"}
-                    messages.insert(2, jira_context)  # Insert after any existing context
-                    
-            elif intent == "get_task_details" and "task_id" in entities:
-                # Get task details from Jira
-                task_id = entities["task_id"]
-                jira_data = jira_client.get_issue(issue_key=task_id)
-                
-                # Add task data to the messages as system context
-                if jira_data:
-                    jira_context = {"role": "system", "content": f"Task details: {json.dumps(jira_data)}"}
-                    messages.insert(2, jira_context)
-            
-            # For other Jira-related intents, we'll let the LLM generate a response
-            # and handle the actual API calls in the appropriate endpoint
+        # Process Jira-related queries using Jira client (with caching)
+        jira_context = None
+        jira_related = intent in [
+            "get_tasks", "get_task_details", "get_my_tasks", "create_task",
+            "update_task", "add_comment", "transition_task", "assign_task"
+        ]
         
-        except Exception as e:
-            logger.error(f"Jira API error: {str(e)}")
-            # Add error information to the context for the LLM
-            error_context = {"role": "system", "content": f"Note: Unable to access Jira data. Error: {str(e)}"}
-            messages.insert(2, error_context)
+        if jira_related:
+            try:
+                # Determine which Jira method to call based on intent
+                if intent == "get_task_details" and "task_id" in entities:
+                    # Get details for a specific task from cached database if possible
+                    task_id = entities["task_id"]
+                    
+                    # Try to get the task from cache first (with 30 min TTL)
+                    jira_context = jira_client._check_jira_cache(task_id, max_age_minutes=30)
+                    
+                    # If not in cache, get from API and cache it
+                    if not jira_context:
+                        jira_context = jira_client.get_issue(task_id)
+                    
+                    # Format Jira context as a message for the LLM
+                    if jira_context:
+                        # Add structured Jira data to the context
+                        jira_message = {
+                            "role": "system", 
+                            "content": f"Jira task details: {json.dumps(jira_context, default=str)}"
+                        }
+                        messages.insert(2, jira_message)
+                
+                elif intent == "get_my_tasks" or intent == "get_tasks":
+                    # Build JQL query based on entities
+                    jql = "ORDER BY updated DESC"
+                    
+                    if "assignee" in entities:
+                        jql = f"assignee = '{entities['assignee']}' {jql}"
+                    else:
+                        jql = f"assignee = currentUser() {jql}"
+                    
+                    if "status_filter" in entities:
+                        jql = f"status = '{entities['status_filter']}' AND {jql}"
+                    
+                    # Cache key for this specific JQL
+                    cache_key = f"jql_{hashlib.md5(jql.encode()).hexdigest()}"
+                    
+                    # Try to get from cache first (with 10 min TTL)
+                    jira_context = jira_client._check_jira_cache(cache_key, max_age_minutes=10)
+                    
+                    # If not in cache, get from API and cache it
+                    if not jira_context:
+                        jira_context = jira_client.search_issues(jql, max_results=10)
+                        # Save to cache
+                        jira_client._save_to_jira_cache(cache_key, jira_context)
+                    
+                    # Format the results for the LLM
+                    if jira_context:
+                        # Add structured Jira data to the context
+                        jira_message = {
+                            "role": "system", 
+                            "content": f"Jira tasks: {json.dumps(jira_context, default=str)}"
+                        }
+                        messages.insert(2, jira_message)
+                        
+                # Add similar logic for other Jira intents...
+                
+            except Exception as e:
+                logger.error(f"Jira API error: {str(e)}")
+                # Add error information to the context for the LLM
+                error_context = {"role": "system", "content": f"Note: Unable to access Jira data. Error: {str(e)}"}
+                messages.insert(2, error_context)
         
         # Send to LLM service
         try:
@@ -376,7 +543,7 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             # Extract the response text
             response_text = llm_response["choices"][0]["message"]["content"]
             
-            # Extract suggested actions based on intent
+            # Generate suggested actions based on intent and entities
             actions = []
             
             # Add actions based on intent and entities
@@ -388,6 +555,23 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                     "text": f"View {task_id} in Jira",
                     "url": f"{settings.JIRA_URL}/browse/{task_id}"
                 })
+                
+                # Add action to update the task status if available
+                if jira_context and "fields" in jira_context and "status" in jira_context["fields"]:
+                    current_status = jira_context["fields"]["status"]["name"]
+                    available_transitions = jira_client.get_transitions(task_id)
+                    
+                    for transition in available_transitions.get("transitions", [])[:3]:  # Limit to first 3
+                        actions.append({
+                            "type": "button",
+                            "text": f"Move to {transition['name']}",
+                            "action": "transition",
+                            "params": {
+                                "task_id": task_id,
+                                "transition_id": transition["id"],
+                                "transition_name": transition["name"]
+                            }
+                        })
                 
             elif intent == "create_task" and "title" in entities:
                 # Add action to create a task in Jira
@@ -402,6 +586,19 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                     "url": new_task_url
                 })
                 
+                # Add quick create action
+                actions.append({
+                    "type": "button",
+                    "text": "Quick Create",
+                    "action": "create_task",
+                    "params": {
+                        "project_key": project_key,
+                        "title": entities["title"],
+                        "description": entities.get("description", ""),
+                        "priority": entities.get("priority", "Medium")
+                    }
+                })
+                
             elif intent in ["get_tasks", "get_my_tasks"]:
                 # Add action to view all tasks in Jira
                 actions.append({
@@ -409,6 +606,23 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                     "text": "View All in Jira",
                     "url": f"{settings.JIRA_URL}/issues/"
                 })
+                
+                # Add project-specific view if a project was mentioned
+                if "project_key" in entities:
+                    project_key = entities["project_key"]
+                    actions.append({
+                        "type": "button",
+                        "text": f"View {project_key} Tasks",
+                        "url": f"{settings.JIRA_URL}/projects/{project_key}/issues/"
+                    })
+            
+            # Format the response text based on content type
+            # Clean up any markdown artifacts or formatting issues from LLM
+            response_text = response_text.replace("```", "").strip()
+            
+            # Add execution time for debugging
+            execution_time = (datetime.now() - start_time).total_seconds()
+            logger.debug(f"Chat request processed in {execution_time:.2f} seconds")
             
             return ChatResponse(
                 response=response_text,
@@ -419,16 +633,26 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
         except Exception as e:
             logger.error(f"LLM service error: {str(e)}")
             
-            # Use fallback response
-            fallback = await llm_service.fallback_response(message.text)
+            # Use fallback response with detailed context
+            fallback_message = await llm_service.fallback_response(message.text)
+            
+            # Add additional context if it's a Jira-related error
+            if jira_related:
+                fallback_message += "\n\nThere seems to be an issue with the Jira integration. Please try again later or access Jira directly."
+            
             return ChatResponse(
-                response=fallback,
+                response=fallback_message,
                 timestamp=datetime.now()
             )
     
     except Exception as e:
         logger.error(f"Error processing chat message: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to process message: {str(e)}")
+        # Provide a user-friendly error message
+        error_message = "I'm sorry, but I encountered an error processing your request. Please try again with a different phrasing."
+        return ChatResponse(
+            response=error_message,
+            timestamp=datetime.now()
+        )
 
 # Memory Management Endpoints
 
@@ -766,3 +990,47 @@ async def get_pending_reminders_api(db: Session = Depends(get_db)) -> Dict[str, 
     except Exception as e:
         logger.error(f"Error fetching pending reminders: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch pending reminders: {str(e)}") 
+
+# Add a user info endpoint for frontend compatibility
+@router.get("/user")
+async def get_user_info(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Get current user info. This endpoint is provided for frontend compatibility.
+    """
+    try:
+        user_id = request.cookies.get("jira_user_id")
+        logger.info(f"Getting user info for user_id: {user_id}")
+        
+        if not user_id:
+            logger.warning("No user_id cookie found")
+            return {
+                "authenticated": False, 
+                "message": "Not authenticated"
+            }
+        
+        user_config = db.query(UserConfig).filter(UserConfig.user_id == user_id).first()
+        
+        if not user_config or not user_config.jira_user_info:
+            logger.warning(f"No user config or user info found for user_id: {user_id}")
+            return {
+                "authenticated": False, 
+                "message": "User data not found"
+            }
+        
+        # Parse the stored user info
+        user_info = json.loads(user_config.jira_user_info)
+        
+        return {
+            "authenticated": True,
+            "user": user_info,
+            "jira_access_token": "***REDACTED***"  # Don't send the actual token to client
+        }
+    except Exception as e:
+        logger.error(f"Error in get_user_info: {str(e)}")
+        return {
+            "authenticated": False,
+            "error": str(e)
+        } 

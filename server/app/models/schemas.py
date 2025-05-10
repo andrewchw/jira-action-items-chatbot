@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
 from enum import Enum
 from datetime import datetime
@@ -46,7 +46,7 @@ class TaskList(BaseModel):
     tasks: List[JiraTask] = Field(..., description="List of Jira tasks")
     total: int = Field(..., description="Total number of tasks")
 
-class Reminder(BaseModel):
+class ReminderModel(BaseModel):
     """
     Schema for task reminders.
     """
@@ -55,7 +55,7 @@ class Reminder(BaseModel):
     message: Optional[str] = Field(None, description="Custom reminder message")
     is_recurring: bool = Field(False, description="Whether the reminder recurs")
     
-class ReminderResponse(BaseModel):
+class ReminderActionResponse(BaseModel):
     """
     Schema for reminder actions from notification responses.
     """
@@ -91,8 +91,7 @@ class ReminderResponse(BaseModel):
     is_recurring: bool = Field(False, description="Whether this reminder recurs")
     success: bool = Field(True, description="Whether the operation was successful")
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ReminderDetail(BaseModel):
     """
@@ -106,8 +105,7 @@ class ReminderDetail(BaseModel):
     is_sent: bool = Field(False, description="Whether this reminder has been sent")
     recurrence_pattern: Optional[str] = Field(None, description="Pattern for recurring reminders")
     
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ReminderList(BaseModel):
     """

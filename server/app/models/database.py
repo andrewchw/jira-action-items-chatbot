@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 import logging
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, create_engine, Float
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, create_engine, Float, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from app.core.config import settings
@@ -76,8 +76,14 @@ class UserConfig(Base):
     notification_enabled = Column(Boolean, default=True)
     reminder_lead_time = Column(Integer, default=15)  # minutes before due
     last_sync = Column(DateTime, nullable=True)
-    jira_token = Column(String(512), nullable=True)
+    jira_token = Column(String(512), nullable=True)  # Basic auth API token
     preferences = Column(Text, nullable=True)  # JSON string of preferences
+    
+    # OAuth 2.0 fields
+    jira_access_token = Column(String(2048), nullable=True)
+    jira_refresh_token = Column(String(2048), nullable=True)
+    jira_token_expires_at = Column(DateTime, nullable=True)
+    jira_user_info = Column(Text, nullable=True)  # JSON string of user info from Jira
 
 # Database connection
 class DatabaseManager:
@@ -100,7 +106,7 @@ class DatabaseManager:
             
             # Test connection
             with self.SessionLocal() as session:
-                session.execute("SELECT 1")
+                session.execute(text("SELECT 1"))
                 logger.info("Database connection test successful")
                 
         except Exception as e:

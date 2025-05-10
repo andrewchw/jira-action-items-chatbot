@@ -1,6 +1,54 @@
 # Jira Action Items Chatbot Server
 
-This is the FastAPI server component for the Jira Action Items Chatbot extension.
+This is the backend server for the Jira Action Items Chatbot Edge extension.
+
+## Environment Setup
+
+Copy the `.env.example` file to `.env` and fill in the following variables:
+
+```
+# Jira Configuration
+JIRA_URL=https://your-domain.atlassian.net
+JIRA_USERNAME=your-email@example.com
+JIRA_API_TOKEN=your-api-token
+DEFAULT_JIRA_PROJECT_KEY=JCAI
+
+# OpenRouter LLM Configuration
+OPENROUTER_API_KEY=your-openrouter-api-key
+DEFAULT_LLM_MODEL=meta-llama/llama-3-8b-instruct
+LLM_MAX_TOKENS=4096
+```
+
+## OpenRouter Model Configuration
+
+### LLM Model Selection
+
+The application supports various OpenRouter models. You can configure which model to use by updating the `DEFAULT_LLM_MODEL` in the `.env` file. Some recommended options:
+
+- `mistralai/mistral-7b-instruct` - Fast, 7B parameter model
+- `meta-llama/llama-3-8b-instruct` - Good balance of performance and speed
+- `meta-llama/llama-3-70b-instruct` - More powerful, but slower and more expensive
+
+There are no truly "free" models on OpenRouter - all models pass through provider pricing. While there are open-source models available, you still pay for the API usage according to OpenRouter's pricing model.
+
+### Token Limits
+
+Most LLMs on OpenRouter support large context windows (8K-128K tokens). The application is configured with:
+
+- Default max tokens: `4096`
+- Context window: Depends on the model (see below)
+
+Common context windows by model:
+- Mistral models: 8K tokens
+- Llama-3 models: 8K tokens
+- Claude models: 48K-128K tokens
+- GPT-4 models: 8K-128K tokens
+
+Note: Even though models support larger context windows, setting too high of a max token count can lead to very slow responses and higher costs. The default `4096` provides a good balance.
+
+To change the token limit:
+1. Update the `LLM_MAX_TOKENS` value in your `.env` file
+2. Restart the server for changes to take effect
 
 ## Features
 
