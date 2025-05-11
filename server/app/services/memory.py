@@ -189,6 +189,23 @@ class MemoryService:
                          it will use the path from settings.
         """
         self.memory_path = memory_path or settings.MEMORY_PATH
+        
+        # Ensure the memory directory exists
+        try:
+            memory_dir = os.path.dirname(self.memory_path)
+            if memory_dir and not os.path.exists(memory_dir):
+                os.makedirs(memory_dir, exist_ok=True)
+                logger.info(f"Created memory directory: {memory_dir}")
+                
+            # If the memory file doesn't exist, create an empty one
+            if not os.path.exists(self.memory_path):
+                with open(self.memory_path, 'w') as f:
+                    f.write("[]")
+                logger.info(f"Created empty memory file: {self.memory_path}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize memory file: {str(e)}. Will use fallback.")
+            self.use_fallback = True
+            
         self.mcp_process = None
         self.use_external_server = True  # Default to using external server
         self.fallback_memory = SimpleInMemoryGraph(self.memory_path)
@@ -333,35 +350,63 @@ class MemoryService:
             if self.use_external_server and not self.mcp_process:
                 # Create a temporary input file
                 input_file = f"temp_mcp_input_{function_name}.json"
-                with open(input_file, 'w') as f:
-                    json.dump(function_call, f)
-                
-                # Run the mcp-knowledge-graph CLI command with explicit path
-                logger.debug(f"Executing MCP via CLI: {MCP_EXECUTABLE} --memory-path {self.memory_path} --function {input_file}")
-                process = await asyncio.create_subprocess_exec(
-                    MCP_EXECUTABLE,
-                    "--memory-path", self.memory_path,
-                    "--function", input_file,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                stdout, stderr = await process.communicate()
-                
-                # Clean up the temporary file
                 try:
-                    os.remove(input_file)
-                except:
-                    pass
-                
-                if process.returncode != 0:
-                    error = stderr.decode() if stderr else "Unknown error"
-                    logger.error(f"MCP CLI error: {error}")
-                    raise Exception(f"MCP function call failed: {error}")
-                
-                # Parse the result
-                result = json.loads(stdout.decode())
-                return result
+                    with open(input_file, 'w') as f:
+                        json.dump(function_call, f)
+                    
+                    # Run the mcp-knowledge-graph CLI command with explicit path
+                    logger.debug(f"Executing MCP via CLI: {MCP_EXECUTABLE} --memory-path {self.memory_path} --function {input_file}")
+                    
+                    # Add timeout to prevent hanging
+                    process = await asyncio.create_subprocess_exec(
+                        MCP_EXECUTABLE,
+                        "--memory-path", self.memory_path,
+                        "--function", input_file,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    # Set a reasonable timeout
+                    try:
+                        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # Kill the process if it times out
+                        try:
+                            process.kill()
+                        except:
+                            pass
+                        logger.error(f"MCP call timed out for {function_name}")
+                        # Fall back to in-memory implementation
+                        self.use_fallback = True
+                        return await self.call_function(function_name, arguments)
+                    
+                    # Clean up the temporary file
+                    try:
+                        os.remove(input_file)
+                    except:
+                        pass
+                    
+                    if process.returncode != 0:
+                        error = stderr.decode() if stderr else "Unknown error"
+                        logger.error(f"Error calling MCP function {function_name}: {error}")
+                        # Fall back to in-memory implementation
+                        self.use_fallback = True
+                        return await self.call_function(function_name, arguments)
+                    
+                    # Parse the result
+                    try:
+                        result = json.loads(stdout.decode())
+                        return result
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse MCP output: {e}")
+                        # Fall back to in-memory implementation
+                        self.use_fallback = True
+                        return await self.call_function(function_name, arguments)
+                except Exception as e:
+                    logger.error(f"Error calling MCP function {function_name}: {str(e)}")
+                    # Fall back to in-memory implementation
+                    self.use_fallback = True
+                    return await self.call_function(function_name, arguments)
             
             # Use existing process if available
             if self.mcp_process:
@@ -375,11 +420,15 @@ class MemoryService:
                 response = json.loads(response_line.decode())
                 
                 return response
-                
-            raise Exception("No MCP server connection available")
+            
+            # If we get here, we have no connection method that worked
+            logger.warning(f"No MCP server connection available, falling back to in-memory implementation")
+            self.use_fallback = True
+            return await self.call_function(function_name, arguments)
         except Exception as e:
             logger.error(f"Error calling MCP function {function_name}: {str(e)}")
-            raise
+            # Return empty result instead of raising exception to avoid blocking API responses
+            return {"error": str(e), "fallback": True}
 
     # Convenience methods for common operations
     

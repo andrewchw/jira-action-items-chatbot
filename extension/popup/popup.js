@@ -70,6 +70,14 @@ let currentJiraContext = {};
 
 // Initialize the popup
 document.addEventListener('DOMContentLoaded', () => {
+  // Add diagnostic console log
+  console.log('Popup initialized', {
+    chatMessages: !!chatMessages,
+    userInput: !!userInput,
+    sendButton: !!sendButton,
+    serverUrlInput: serverUrlInput ? serverUrlInput.value : null
+  });
+  
   // Load settings from storage
   loadSettings();
   
@@ -307,6 +315,42 @@ function loadChatHistory() {
       });
     }
   });
+}
+
+// Function to handle chat response from the server
+function handleChatResponse(data, typingIndicator) {
+  // Log the response for debugging
+  console.log('Received response:', data);
+
+  // Remove typing indicator or update it
+  if (typingIndicator) {
+    // If response was successful, update the typing indicator with the response text
+    if (data && data.response) {
+      // Make sure the typing indicator is properly updated with the response text
+      updateMessage(typingIndicator, data.response);
+      
+      // Handle any actions (buttons) if provided
+      if (data.actions && Array.isArray(data.actions) && data.actions.length > 0) {
+        handleActions(data.actions);
+      }
+    } else {
+      // If no valid response, show error
+      updateMessage(typingIndicator, "Sorry, I received an empty response. Please try again.");
+    }
+  } else {
+    // If no typing indicator was provided, add a new message
+    if (data && data.response) {
+      addMessage('bot', data.response);
+      
+      // Handle any actions (buttons) if provided
+      if (data.actions && Array.isArray(data.actions) && data.actions.length > 0) {
+        handleActions(data.actions);
+      }
+    } else {
+      // If no valid response, show error
+      addMessage('bot', "Sorry, I received an empty response. Please try again.");
+    }
+  }
 }
 
 // Add chat message to history and UI
@@ -550,7 +594,7 @@ async function sendMessage() {
   // Add typing indicator
   const typingIndicator = document.createElement('div');
   typingIndicator.className = 'message bot-message typing-indicator';
-  typingIndicator.innerHTML = '<div class="dots"><span>.</span><span>.</span><span>.</span></div>';
+  typingIndicator.innerHTML = '<div class="message-content"><div class="dots"><span>.</span><span>.</span><span>.</span></div></div>';
   chatMessages.appendChild(typingIndicator);
   chatMessages.scrollTop = chatMessages.scrollHeight;
   
@@ -619,8 +663,11 @@ I'll use the default project key "${projectKey}" unless you specify another one.
       // Log the request for debugging
       console.log('Sending message to server:', requestData);
       
+      // Get server URL from input value
+      const serverUrl = serverUrlInput.value || 'http://localhost:8000';
+      
       // Send the request
-      fetch(serverUrlInput.value + '/api/chat', {
+      fetch(serverUrl + '/api/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -635,6 +682,7 @@ I'll use the default project key "${projectKey}" unless you specify another one.
           return response.json();
         })
         .then(data => {
+          console.log('Response received from server:', data);
           // Handle the response
           handleChatResponse(data, typingIndicator);
         })
@@ -1220,12 +1268,26 @@ function displayReminders(reminders) {
 
 // Update an existing message element
 function updateMessage(messageElement, newText) {
-  if (!messageElement) return;
+  if (!messageElement) {
+    console.error('Cannot update message: messageElement is null or undefined');
+    return;
+  }
+  
+  console.log('Updating message element:', messageElement);
+  console.log('New text:', newText);
   
   // Find the message content element
   const contentElement = messageElement.querySelector('.message-content');
   if (contentElement) {
     contentElement.innerHTML = newText;
+    console.log('Message content updated successfully');
+  } else {
+    console.error('Message content element not found within messageElement');
+    // Fallback: create content element if it doesn't exist
+    const newContentElement = document.createElement('div');
+    newContentElement.className = 'message-content';
+    newContentElement.innerHTML = newText;
+    messageElement.appendChild(newContentElement);
   }
   
   // Scroll to bottom

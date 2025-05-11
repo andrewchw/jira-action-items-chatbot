@@ -542,6 +542,9 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
         # Action storage
         actions = []
         
+        # Initialize response_text to None - will be set either by direct action or LLM
+        response_text = None
+        
         # Try to retrieve user preferences from memory
         try:
             # Search for the current user in memory
@@ -552,15 +555,20 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                 user_entity = search_result["entities"][0]
                 
                 # Add observation about this conversation
-                await memory_service.add_observations([
-                    {
-                        "entityName": "current_user",
-                        "contents": [f"Asked about: {sanitized_text[:50]}..."]
-                    }
-                ])
+                try:
+                    await memory_service.add_observations([
+                        {
+                            "entityName": "current_user",
+                            "contents": [f"Asked about: {sanitized_text[:50]}..."]
+                        }
+                    ])
+                except Exception as obs_err:
+                    # Just log the error but continue with execution
+                    logger.warning(f"Failed to add observation to memory: {str(obs_err)}")
         except Exception as e:
             # If memory access fails, continue without personalization
             logger.error(f"Memory access error: {str(e)}")
+            # Don't return early, continue with the request processing
         
         # Include any provided context with the request
         if message.context:
@@ -679,7 +687,9 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                                 assignee = response.get("assignee") or entities.get("assignee")
                                 assignee_info = f" and assigned to {assignee}"
                             
+                            # Set direct response text for Jira task creation - no need for LLM
                             response_text = f"✅ I've created Jira task {issue_key}{assignee_info}: {summary}. You can click the button below to view it."
+                            logger.info(f"Setting direct response for Jira task creation: {response_text[:50]}...")
                             
                             # Store in memory if possible
                             try:
@@ -694,11 +704,14 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                                     }
                                 ])
                             except Exception as memory_err:
+                                # Just log the memory error but continue with the response
                                 logger.warning(f"Error adding task to memory: {str(memory_err)}")
+                                # Don't return or raise here so the response can continue
                         else:
                             # Failed
                             error_message = response.get("error", "Unknown error")
                             response_text = f"❌ I had difficulty creating your Jira task: {error_message}"
+                            logger.warning(f"Setting error response for Jira task creation: {response_text}")
                             
                             # Add retry action
                             actions.append({
@@ -725,29 +738,39 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                 error_context = {"role": "system", "content": f"Note: Unable to access Jira data. Error: {str(e)}"}
                 messages.insert(2, error_context)
         
-        # Send to LLM service
-        try:
-            # Try to get response from LLM
-            llm_response = await llm_service.chat_completion(
-                messages=messages,
-                temperature=0.7,  # Use a moderate temperature for balanced responses
-                use_cache=True
-            )
-            
-            # Extract the response text
+        # Only call LLM if we don't already have a direct response_text set (like from Jira task creation)
+        if response_text is None:
             try:
-                if not llm_response or "choices" not in llm_response or not llm_response["choices"]:
-                    logger.error(f"LLM service error: Invalid response format - {llm_response}")
+                # Try to get response from LLM
+                llm_response = await llm_service.chat_completion(
+                    messages=messages,
+                    temperature=0.7,  # Use a moderate temperature for balanced responses
+                    use_cache=True
+                )
+                
+                # Extract the response text
+                try:
+                    if not llm_response or "choices" not in llm_response or not llm_response["choices"]:
+                        logger.error(f"LLM service error: Invalid response format - {llm_response}")
+                        response_text = "I'm sorry, I encountered an issue processing your request. Please try again or rephrase your query."
+                    else:
+                        response_text = llm_response["choices"][0]["message"]["content"]
+                        logger.debug(f"Response from LLM: {response_text[:50]}...")
+                except Exception as e:
+                    logger.error(f"LLM service error: {str(e)}")
                     response_text = "I'm sorry, I encountered an issue processing your request. Please try again or rephrase your query."
-                else:
-                    response_text = llm_response["choices"][0]["message"]["content"]
             except Exception as e:
                 logger.error(f"LLM service error: {str(e)}")
-                response_text = "I'm sorry, I encountered an issue processing your request. Please try again or rephrase your query."
-            
-            # Generate suggested actions based on intent and entities
-            actions = []
-            
+                
+                # Use fallback response with detailed context
+                response_text = await llm_service.fallback_response(sanitized_text)
+                
+                # Add additional context if it's a Jira-related error
+                if jira_related:
+                    response_text += "\n\nThere seems to be an issue with the Jira integration. Please try again later or access Jira directly."
+        
+        # Generate suggested actions based on intent and entities if none were set already
+        if not actions:
             # Add actions based on intent and entities
             if intent == "get_task_details" and "task_id" in entities:
                 # Add action to view the task in Jira
@@ -817,36 +840,39 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                         "text": f"View {project_key} Tasks",
                         "url": f"{settings.JIRA_URL}/projects/{project_key}/issues/"
                     })
-            
-            # Format the response text based on content type
+        
+        # Format the response text based on content type (if we have one)
+        if response_text:
             # Clean up any markdown artifacts or formatting issues from LLM
             response_text = response_text.replace("```", "").strip()
+        else:
+            # Fallback if somehow we still don't have a response
+            response_text = "I'm sorry, I couldn't process your request properly. Please try again."
             
-            # Add execution time for debugging
-            execution_time = (datetime.now() - start_time).total_seconds()
-            logger.debug(f"Chat request processed in {execution_time:.2f} seconds")
+        # Add execution time for debugging
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.debug(f"Chat request processed in {execution_time:.2f} seconds")
+        
+        # Log the final response we're returning
+        logger.info(f"Returning response_text: {response_text[:50]}... with {len(actions)} actions")
+        
+        # Create and return the final response object
+        response_object = ChatResponse(
+            response=response_text,
+            actions=actions if actions else None,
+            timestamp=datetime.now()
+        )
+        
+        # Ensure the response field is set
+        if not response_object.response:
+            logger.warning("Response field is empty, explicitly setting it")
+            response_object.response = response_text
             
-            return ChatResponse(
-                response=response_text,
-                actions=actions if actions else None,
-                timestamp=datetime.now()
-            )
+        # Log entire response for debugging
+        logger.debug(f"Complete response object: {response_object}")
+        
+        return response_object
             
-        except Exception as e:
-            logger.error(f"LLM service error: {str(e)}")
-            
-            # Use fallback response with detailed context
-            fallback_message = await llm_service.fallback_response(sanitized_text)
-            
-            # Add additional context if it's a Jira-related error
-            if jira_related:
-                fallback_message += "\n\nThere seems to be an issue with the Jira integration. Please try again later or access Jira directly."
-            
-            return ChatResponse(
-                response=fallback_message,
-                timestamp=datetime.now()
-            )
-    
     except Exception as e:
         error_message = str(e)
         logger.error(f"Error processing chat message: {error_message}")
@@ -871,17 +897,37 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             friendly_response = f"I'm sorry, I encountered an error processing your request. {error_message}"
             
             # Return a friendly error message
-            return ChatResponse(
+            response_object = ChatResponse(
                 response=friendly_response,
                 timestamp=datetime.now()
             )
+            
+            # Ensure the response field is set
+            if not response_object.response:
+                logger.warning("Response field is empty, explicitly setting it")
+                response_object.response = friendly_response
+            
+            # Log entire response for debugging
+            logger.debug(f"Complete response object: {response_object}")
+            
+            return response_object
         except Exception as response_error:
             # Last resort fallback
             logger.error(f"Error creating error response: {str(response_error)}")
-            return ChatResponse(
+            response_object = ChatResponse(
                 response="I'm sorry, I encountered an unexpected error. Please try again later.",
                 timestamp=datetime.now()
             )
+            
+            # Ensure the response field is set
+            if not response_object.response:
+                logger.warning("Response field is empty, explicitly setting it")
+                response_object.response = "I'm sorry, I encountered an unexpected error. Please try again later."
+            
+            # Log entire response for debugging
+            logger.debug(f"Complete response object: {response_object}")
+            
+            return response_object
 
 # Memory Management Endpoints
 
