@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "C:\Users\Loupor\iCloudDocs\iCloudDrive\Documents\VSCode\jira-action-items-chatbot\server\test_syntax.py", line 17, in <module>
+    print("\u2705 Successfully imported JiraClient class and settings")
+UnicodeEncodeError: 'cp950' codec can't encode character '\u2705' in position 0: illegal multibyte sequence
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Loupor\iCloudDocs\iCloudDrive\Documents\VSCode\jira-action-items-chatbot\server\test_syntax.py", line 19, in <module>
+    print(f"\u274c Error importing modules: {str(e)}")
+UnicodeEncodeError: 'cp950' codec can't encode character '\u274c' in position 0: illegal multibyte sequence

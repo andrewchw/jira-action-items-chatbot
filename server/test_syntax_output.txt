@@ -1,0 +1,28 @@
+[OK] Successfully imported JiraClient class and settings
+[OK] Successfully instantiated JiraClient (cloud)
+   Is Cloud: True
+[OK] Successfully instantiated JiraClient (server)
+   Is Cloud: False
+[OK] Successfully ensured helper methods exist
+
+[OK] Successfully mapped assignee with email (cloud)
+   Assignee field: {
+  "emailAddress": "test.user@example.com"
+}
+
+[OK] Successfully mapped assignee with username (cloud)
+   Assignee field: {
+  "accountId": "testuser"
+}
+
+[OK] Successfully mapped assignee with username (server)
+   Assignee field: {
+  "name": "testuser"
+}
+
+[OK] Successfully mapped reporter with email
+   Reporter field: {
+  "emailAddress": "test.reporter@example.com"
+}
+
+[OK] All syntax tests passed!

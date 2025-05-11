@@ -69,8 +69,7 @@ class JiraClient:
         # Log initialization
         auth_method = "OAuth" if self.use_oauth else "Basic Auth"
         logger.info(f"Initializing Jira client for {self.base_url} using {auth_method}")
-        
-        # Default headers for all requests
+          # Default headers for all requests
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
@@ -82,6 +81,9 @@ class JiraClient:
         
         # Cache settings
         self.default_cache_ttl = 15  # Default cache TTL in minutes
+        
+        # Determine if this is a Jira Cloud instance (vs. Server/DC)
+        self.is_cloud = ".atlassian.net" in self.base_url.lower()
     
     def get_auth(self):
         """
@@ -326,7 +328,6 @@ class JiraClient:
             if response.status_code >= 400:
                 try:
                     error_data = response.json()
-                    
                     # Handle both errorMessages array and errors object
                     if "errorMessages" in error_data and error_data["errorMessages"]:
                         error_message = error_data["errorMessages"][0]
@@ -335,6 +336,19 @@ class JiraClient:
                         error_parts = []
                         for field, msg in error_data["errors"].items():
                             error_parts.append(f"{field}: {msg}")
+                            
+                            # Special handling for specific Jira field restrictions
+                            # Log extra details for common field restriction errors
+                            if "cannot be set" in str(msg) and field == "reporter":
+                                logger.warning(f"The Jira instance does not allow setting the reporter field manually. This is common in cloud instances.")
+                            
+                            # Additional logging for assignee field errors
+                            if field == "assignee":
+                                logger.error(f"Assignee field error: {msg}")
+                                # Print the request data to help debug
+                                if data and "fields" in data and "assignee" in data["fields"]:
+                                    logger.error(f"Assignee data sent: {json.dumps(data['fields']['assignee'])}")
+                                
                         error_message = ", ".join(error_parts)
                     else:
                         error_message = f"HTTP error {response.status_code}"
@@ -442,7 +456,35 @@ class JiraClient:
                 "issuetype": {
                     "name": issue_type
             }
-        }
+        }        # Try to set reporter to current user if not specified in additional fields
+        # Note: Some Jira instances (especially cloud) don't allow manually setting the reporter
+        # In those cases, Jira will automatically set the reporter to the API user
+        reporter_in_additional = additional_fields and 'reporter' in additional_fields
+        
+        # Check if we should try to set the reporter field automatically
+        # Only do this if:
+        # 1. The reporter is not already specified in additional_fields
+        # 2. We're not in a Jira Cloud instance (which usually doesn't allow setting reporter)
+        #    OR we've specifically checked that this instance supports it
+        if not reporter_in_additional and (not self.is_cloud or hasattr(self, '_supports_reporter') and self._supports_reporter):
+            try:
+                myself = self.get_myself()
+                if myself and ('accountId' in myself or 'name' in myself):
+                    reporter_field = {}
+                    if self.is_cloud and 'accountId' in myself:
+                        reporter_field["accountId"] = myself["accountId"]
+                    elif 'name' in myself:
+                        reporter_field["name"] = myself["name"]
+                    
+                    if reporter_field:
+                        fields["reporter"] = reporter_field
+                        logger.info(f"Setting reporter to current user: {myself.get('displayName', 'Unknown')}")
+            except Exception as e:
+                logger.warning(f"Failed to set reporter to current user: {str(e)}")
+        elif reporter_in_additional and self.is_cloud:
+            # If the user explicitly specified a reporter but we're in a cloud instance,
+            # warn them that it might not work
+            logger.warning("Reporter field specified in additional_fields, but Jira Cloud often doesn't allow setting this field")
         
         # Add description if provided - format as Atlassian Document Format (ADF) for API v3
         if description:
@@ -472,19 +514,62 @@ class JiraClient:
                     if isinstance(value, str):
                         fields["priority"] = {"name": value}
                     else:
-                        fields["priority"] = value
-                elif key == "labels":
+                        fields["priority"] = value                
+                elif key == "labels":                    
                     # Handle labels as list or string
                     if isinstance(value, str):
                         fields["labels"] = [v.strip() for v in value.split(",")]
                     else:
-                        fields["labels"] = value
+                        fields["labels"] = value                
                 elif key == "assignee":
                     # Handle assignee as string or object
                     if isinstance(value, str):
-                        fields["assignee"] = {"name": value}
+                        # Check if this looks like an email (contains @)
+                        if '@' in value:
+                            fields["assignee"] = {"emailAddress": value}
+                            logger.info(f"Using email address for assignee: {value}")
+                        # Check if it's an account ID (looks like a UUID with standard format)
+                        # UUID standard format: 8-4-4-4-12 hex digits (36 chars including hyphens)
+                        elif len(value) > 20 and '-' in value and value.count('-') >= 4:
+                            fields["assignee"] = {"accountId": value}
+                            logger.info(f"Using account ID for assignee: {value}")
+                        else:
+                            # For Jira Cloud instances, must have a valid accountId UUID format
+                            if self.is_cloud:
+                                # Try to find a valid account ID for this username/string
+                                account_id = self.find_user_account_id(value)
+                                if account_id:
+                                    fields["assignee"] = {"accountId": account_id}
+                                    logger.info(f"Translated assignee '{value}' to accountId: {account_id}")
+                                else:                                    # This will fail because Jira Cloud requires accountId in valid format
+                                    # Log a warning but continue (the API will return a proper error)
+                                    logger.warning(f"INVALID ASSIGNEE FORMAT: '{value}' is not a valid accountId for Jira Cloud and could not be resolved.")
+                                    logger.warning("Skipping assignee field as it would fail validation.")
+                                    # Skip adding this field rather than sending an invalid format
+                                    continue
+                            else:
+                                # For server/DC instances, username is acceptable
+                                fields["assignee"] = {"name": value}
+                                logger.debug(f"Setting assignee with username: {value}")
                     else:
+                        # Handle object format (should be pre-formatted correctly)
                         fields["assignee"] = value
+                elif key == "reporter":
+                    # Note: Some Jira instances don't allow setting reporter directly
+                    # We'll include it in the request, but it might be ignored
+                    logger.info(f"Attempting to set reporter explicitly (may not be supported by all Jira instances)")
+                    if isinstance(value, str):
+                        # Check if this looks like an email (contains @)
+                        if '@' in value:
+                            fields["reporter"] = {"emailAddress": value}
+                        # Check if it's an account ID (looks like a UUID)
+                        elif len(value) > 10 and '-' in value:
+                            fields["reporter"] = {"accountId": value}
+                        else:
+                            # First try accountId, then name - depends on Jira version
+                            fields["reporter"] = {"accountId": value} if self.is_cloud else {"name": value}
+                    else:
+                        fields["reporter"] = value
                 elif key == "due_date":
                     # Handle due date - correct field name for Jira API is 'duedate'
                     fields["duedate"] = value
@@ -700,7 +785,6 @@ class JiraClient:
         return self._make_request("GET", endpoint, params=params)
     
     # New methods for entity mapping and natural language processing
-    
     def map_nl_to_jira_fields(self, entities: Dict[str, Any]) -> Dict[str, Any]:
         """
         Map natural language entities to Jira fields.
@@ -712,12 +796,12 @@ class JiraClient:
             Dictionary of Jira fields
         """
         jira_fields = {}
-        
         # Map common entities to Jira fields
         field_mappings = {
             "summary": ["summary", "title", "subject"],
             "description": ["description", "details", "body"],
             "assignee": ["assignee", "assigned_to", "owner"],
+            "reporter": ["reporter", "reported_by", "creator"],
             "priority": ["priority", "importance"],
             "due_date": ["due_date", "deadline", "due"],
             "type": ["type", "issue_type", "ticket_type"],
@@ -729,11 +813,21 @@ class JiraClient:
         # Process each entity and map to corresponding Jira field
         for jira_field, entity_keys in field_mappings.items():
             for key in entity_keys:
-                if key in entities and entities[key]:
+                if key in entities and entities[key]:                    
                     # Special handling for different field types
-                    if jira_field == "assignee":
-                        # Map to correct assignee structure
-                        jira_fields[jira_field] = {"name": entities[key]}
+                    if jira_field == "assignee" or jira_field == "reporter":
+                        # Map to correct user structure based on instance type
+                        user_value = entities[key]
+                        if '@' in user_value:
+                            # If it looks like an email, use emailAddress
+                            jira_fields[jira_field] = {"emailAddress": user_value}
+                        elif self.is_cloud:
+                            # For cloud, prefer accountId but fallback to name if it's all we have
+                            # The actual accountId resolution happens later in create_jira_issue
+                            jira_fields[jira_field] = {"accountId": user_value}
+                        else:
+                            # For server/DC, use name
+                            jira_fields[jira_field] = {"name": user_value}
                     elif jira_field == "priority":
                         # Map priority string to Jira priority structure
                         priority_name = self._map_priority_name(entities[key])
@@ -1173,6 +1267,224 @@ class JiraClient:
                 "success": False,
                 "error": str(e)
             }
+            
+    def supports_reporter_field(self) -> bool:
+        """
+        Check if the Jira instance supports setting the reporter field.
+        This is often restricted in Jira Cloud instances.
+        
+        Returns:
+            True if setting the reporter field is supported, False otherwise
+        """
+        # First, check if we already know the answer from instance memory
+        if hasattr(self, '_supports_reporter'):
+            return self._supports_reporter
+            
+        # Then, check if we have a stored preference in the database
+        try:
+            db = next(get_db())
+            
+            # Since this is a per-instance setting, use the base URL as the key
+            key = f"jira_reporter_support_{self._generate_cache_key('GET', self.base_url, None, None)}"
+            
+            # Get user config
+            user_id = self.user_id or "default"
+            config = db.query(UserConfig).filter(
+                UserConfig.user_id == user_id,
+                UserConfig.key == key
+            ).first()
+            
+            if config:
+                support_value = config.value.lower() == 'true'
+                self._supports_reporter = support_value
+                logger.info(f"Using stored reporter field support preference: {support_value}")
+                return support_value
+        except Exception as e:
+            logger.debug(f"Could not retrieve reporter field support preference: {str(e)}")
+        
+        # Most Jira Cloud instances don't allow setting reporter directly via API
+        if self.is_cloud:
+            try:
+                # Try to get field metadata which would indicate if the field is editable
+                fields_endpoint = "/rest/api/3/field"
+                fields_data = self._make_request("GET", fields_endpoint)
+                
+                # Look for the reporter field in the returned fields
+                reporter_field = next((f for f in fields_data if f.get("name") == "Reporter"), None)
+                
+                # If the field exists and is not marked as readonly
+                if reporter_field and not reporter_field.get("schema", {}).get("readonly", False):
+                    logger.info("Jira instance supports setting reporter field")
+                    support_value = True
+                else:
+                    logger.info("Jira instance does not support setting reporter field")
+                    support_value = False
+                
+                # Save this result for future use
+                self.set_reporter_field_support(support_value)
+                return support_value
+            except Exception as e:
+                logger.warning(f"Could not determine if reporter field is supported: {str(e)}")
+                # Default to false for cloud instances when in doubt
+                self.set_reporter_field_support(False)
+                return False
+        
+        # Server/DC instances typically allow setting reporter
+        support_value = not self.is_cloud
+        self.set_reporter_field_support(support_value)
+        return support_value
+
+    def set_reporter_field_support(self, supported: bool = False) -> None:
+        """
+        Set whether this Jira instance supports setting the reporter field.
+        This allows the client to avoid attempting to set the reporter field
+        for instances that don't support it.
+        
+        Args:
+            supported: Whether the reporter field is supported
+        """
+        self._supports_reporter = supported
+        
+        # Try to store this in user preferences if database is available
+        try:
+            # Get user settings from database
+            db = next(get_db())
+            
+            # Since this is a per-instance setting, use the base URL as the key
+            key = f"jira_reporter_support_{self._generate_cache_key('GET', self.base_url, None, None)}"
+            
+            # Create or update user config
+            user_id = self.user_id or "default"
+            config = get_or_create_user_config(db, user_id, key, str(supported).lower())
+            
+            logger.info(f"Saved reporter field support preference for {self.base_url}: {supported}")
+        except Exception as e:
+            logger.warning(f"Could not save reporter field support preference: {str(e)}")
+            # Still store it in instance memory
+            self._supports_reporter = supported    
+    
+    def find_user_account_id(self, username_or_email: str) -> Optional[str]:
+        """
+        Find the account ID for a user by their username or email.
+        This is particularly important for Jira Cloud where account IDs are required.
+        
+        Args:
+            username_or_email: Username or email of the user
+            
+        Returns:
+            Account ID if found, otherwise None
+        """
+        try:            # Check if the input already looks like a valid account ID
+            # Case 1: Standard UUID format with dashes (8-4-4-4-12 hex digits)
+            if (isinstance(username_or_email, str) and 
+                len(username_or_email) > 20 and 
+                '-' in username_or_email and 
+                username_or_email.count('-') >= 4):
+                
+                # This looks like a valid UUID format account ID
+                logger.info(f"Input '{username_or_email}' appears to be a valid UUID format, using directly")
+                return username_or_email
+                  # Case 2: Atlassian numeric account ID format (often starts with 5)
+            elif (isinstance(username_or_email, str) and 
+                 len(username_or_email) > 10 and
+                 username_or_email.startswith("5") and
+                 all(c.isalnum() for c in username_or_email)):
+                
+                # This is a valid Atlassian numeric account ID
+                logger.info(f"Input '{username_or_email}' appears to be a valid numeric Atlassian account ID, using directly")
+                return username_or_email
+                
+            # Case 3: Non-standard Atlassian account ID (alphanumeric but no dashes)
+            elif (isinstance(username_or_email, str) and
+                 len(username_or_email) > 10 and
+                 all(c.isalnum() for c in username_or_email)):
+                
+                # This might be a valid non-standard Atlassian account ID
+                logger.info(f"Input '{username_or_email}' appears to be a valid non-standard format account ID, using directly")
+                return username_or_email
+                
+            # Try to search by query
+            logger.info(f"Searching for Jira user account ID with query: {username_or_email}")
+            users = self._make_request(
+                "GET", 
+                "/rest/api/3/user/search", 
+                params={"query": username_or_email, "maxResults": 10}
+            )
+            
+            if users and isinstance(users, list):
+                logger.info(f"Found {len(users)} users matching '{username_or_email}'")
+                # Check for exact or close matches first
+                for user in users:
+                    # For email matches (most reliable)
+                    if "emailAddress" in user and user["emailAddress"] and user["emailAddress"].lower() == username_or_email.lower():
+                        logger.info(f"Found exact email match: {user.get('emailAddress')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+                    
+                    # For username matches
+                    if "name" in user and user["name"] and user["name"].lower() == username_or_email.lower():
+                        logger.info(f"Found exact username match: {user.get('name')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+                    
+                    # For display name matches
+                    if "displayName" in user and user["displayName"] and user["displayName"].lower() == username_or_email.lower():
+                        logger.info(f"Found exact display name match: {user.get('displayName')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+                
+                # Check for partial matches if no exact match found
+                for user in users:
+                    # For partial display name matches (case insensitive)
+                    if "displayName" in user and user["displayName"] and username_or_email.lower() in user["displayName"].lower():
+                        logger.info(f"Found partial display name match: {user.get('displayName')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+                    
+                    # For partial username matches (case insensitive)
+                    if "name" in user and user["name"] and username_or_email.lower() in user["name"].lower():
+                        logger.info(f"Found partial username match: {user.get('name')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+                
+                # If no specific match found but we have results, return the first account ID
+                if len(users) > 0 and "accountId" in users[0]:
+                    logger.warning(f"No exact match found for '{username_or_email}', using closest match: {users[0].get('displayName')}")
+                    return users[0].get("accountId")
+            
+            # If direct search didn't work, try user picker API as a fallback
+            try:
+                logger.info(f"Trying user picker API for '{username_or_email}'")
+                picker_results = self._make_request(
+                    "GET",
+                    "/rest/api/3/user/picker",
+                    params={"query": username_or_email, "maxResults": 1}
+                )
+                
+                if picker_results and "users" in picker_results and picker_results["users"]:
+                    user = picker_results["users"][0]
+                    if "accountId" in user:
+                        logger.info(f"Found user via picker API: {user.get('displayName')} with accountId: {user.get('accountId')}")
+                        return user.get("accountId")
+            except Exception as picker_err:
+                logger.warning(f"User picker API attempt failed: {str(picker_err)}")
+                
+            logger.warning(f"Could not find account ID for '{username_or_email}'")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding user account ID for '{username_or_email}': {str(e)}")
+            return None
+
+    def get_user(self, username: str) -> Dict:
+        """
+        Get user information.
+        
+        Args:
+            username: Username
+            
+        Returns:
+            User data
+        """
+        endpoint = f"/rest/api/3/user"
+        params = {"username": username}
+        
+        return self._make_request("GET", endpoint, params=params)
 
 # Standalone function for creating Jira issues (used by API endpoints)
 def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
@@ -1224,8 +1536,7 @@ def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
         description = entities.get("description", "")
         
         # Get issue type
-        issue_type = entities.get("issue_type", "Task")
-        
+        issue_type = entities.get("issue_type", "Task")            
         # Validate assignee if provided
         if entities.get("assignee"):
             assignee = entities.get("assignee")
@@ -1235,53 +1546,115 @@ def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
             cached_user = get_jira_user_by_name(db, assignee)
             
             if cached_user:
-                # We found the user in our local cache, use the username from there
-                logger.info(f"Found cached user for assignee '{assignee}': {cached_user.username}")
-                entities["assignee"] = cached_user.username
+                # We found the user in our local cache
+                if client.is_cloud and cached_user.account_id:
+                    # For Cloud instances, we must use the account_id
+                    entities["assignee"] = cached_user.account_id
+                    logger.info(f"Found cached user for assignee '{assignee}': {cached_user.display_name} (using account_id: {cached_user.account_id})")
+                else:
+                    # For Server/DC instances, use the username
+                    entities["assignee"] = cached_user.username
+                    logger.info(f"Found cached user for assignee '{assignee}': {cached_user.username}")
             else:
                 # We need to validate the assignee against Jira
-                # Check if we're in GDPR mode - if so, we may not be able to search for users
-                try:
-                    # Try to search for the user in Jira
-                    # First try query parameter (Cloud)
+                # Check if we're in GDPR mode - if so, we may not be able to search for users                
+                # try:
+                valid_user = False
+                  # For Jira Cloud, we need to find the account ID
+                if client.is_cloud:                    # First, check if the assignee is already a valid account ID
+                    # Case 1: Standard UUID format with dashes
+                    if (isinstance(assignee, str) and 
+                        len(assignee) > 20 and 
+                        '-' in assignee and 
+                        assignee.count('-') >= 4):
+                        
+                        # Already looks like a valid accountId UUID format
+                        entities["assignee"] = assignee
+                        logger.info(f"Assignee '{assignee}' appears to be in valid UUID format, using directly")
+                        valid_user = True                    # Case 2: Atlassian numeric account ID format (often starts with 5)
+                    elif (isinstance(assignee, str) and 
+                         len(assignee) > 10 and
+                         assignee.startswith("5") and
+                         all(c.isalnum() for c in assignee)):
+                        
+                        # This is a valid Atlassian numeric ID format
+                        entities["assignee"] = assignee
+                        logger.info(f"Assignee '{assignee}' appears to be a valid numeric Atlassian ID, using directly")
+                        valid_user = True
+                    # Case 3: Non-standard Atlassian account ID (alphanumeric but no dashes)
+                    elif (isinstance(assignee, str) and
+                         len(assignee) > 10 and
+                         all(c.isalnum() for c in assignee)):
+                        
+                        # This might be a valid non-standard Atlassian account ID
+                        entities["assignee"] = assignee
+                        logger.info(f"Assignee '{assignee}' appears to be a valid non-standard account ID, using directly")
+                        valid_user = True
+                    else:
+                        # Use our dedicated method to find a user's account ID
+                        logger.info(f"Looking up account ID for assignee '{assignee}'")
+                        account_id = client.find_user_account_id(assignee)
+                        
+                        if account_id:
+                            # Use the account ID directly
+                            entities["assignee"] = account_id
+                            logger.info(f"Found Jira Cloud account ID for '{assignee}': {account_id}")
+                            valid_user = True
+                            
+                            # Try to get full user details to cache
+                            try:
+                                user_details = client._make_request(
+                                    "GET",
+                                    f"/rest/api/3/user",
+                                    params={"accountId": account_id}
+                                )
+                                if user_details:
+                                    update_jira_user_cache(db, user_details)
+                                    logger.info(f"Cached user details for '{assignee}' with accountId: {account_id}")
+                            except Exception as detail_err:
+                                logger.warning(f"Could not fetch full user details for caching: {str(detail_err)}")
+                else:
+                    # For Server/DC installations, search by name works
                     users = client._make_request(
                         "GET", 
                         "/rest/api/3/user/search", 
                         params={"query": assignee, "maxResults": 10}
-                    )
-                    
-                    valid_user = False
-                    
+                    )                    
                     if users and isinstance(users, list):
-                        # Check if any of the returned users match
-                        for user in users:
+                        for user in users:                            
                             if user.get("displayName", "").lower() == assignee.lower() or \
-                               user.get("name", "").lower() == assignee.lower() or \
-                               user.get("emailAddress", "").lower() == assignee.lower():
-                                # Update entities with correct user format
+                                user.get("name", "").lower() == assignee.lower() or \
+                                user.get("emailAddress", "").lower() == assignee.lower():
+                                # For server/DC, use name
                                 entities["assignee"] = user.get("name")
-                                logger.info(f"Found Jira user for assignee '{assignee}': {user.get('name')}")
+                                logger.info(f"Found Jira Server user for assignee '{assignee}': {user.get('name')}")
+                                
                                 valid_user = True
                                 
-                                # Also cache this user for future lookups
-                                update_jira_user_cache(db, user)
+                                # Also cache this user for future lookups                                update_jira_user_cache(db, user)
                                 break
-                    
-                    if not valid_user:
-                        # Sync users and try again
-                        client.sync_users(db)
-                        
-                        # Try one more time with the local cache
-                        cached_user = get_jira_user_by_name(db, assignee)
-                        if cached_user:
-                            entities["assignee"] = cached_user.username
-                            logger.info(f"Found user in refreshed cache: {cached_user.username}")
+                
+                if not valid_user:
+                    # Sync users and try again
+                    client.sync_users(db)
+                    # Try one more time with the local cache
+                    cached_user = get_jira_user_by_name(db, assignee)
+                    if cached_user:
+                        # Use accountId for cloud instances, otherwise username
+                        if client.is_cloud and cached_user.account_id:
+                            entities["assignee"] = cached_user.account_id
+                            logger.info(f"Found user in refreshed cache (using accountId): {cached_user.display_name} ({cached_user.account_id})")
                         else:
-                            logger.warning(f"Assignee '{assignee}' not found in Jira, may cause creation to fail")
-                            
-                except Exception as e:
-                    # If we can't validate the assignee, log it but continue - Jira will validate on creation
-                    logger.warning(f"Failed to validate assignee '{assignee}': {str(e)}")
+                            entities["assignee"] = cached_user.username
+                            logger.info(f"Found user in refreshed cache (using username): {cached_user.username}")
+                    else:
+                        logger.warning(f"Assignee '{assignee}' not found in Jira, may cause creation to fail")
+                        # If we're in a cloud instance, this will definitely fail due to account ID requirements
+                        if client.is_cloud:
+                            return {
+                                "error": f"Assignee '{assignee}' not found in Jira Cloud. Please use a valid username, email or account ID."
+                            }
+                        # For server instances we can try to continue, Jira will validate
         
         # Prepare additional fields
         additional_fields = {}
@@ -1296,9 +1669,41 @@ def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
                 
             # Add to additional fields
             additional_fields[key] = value
-            
-        # Call the Jira API client
+              # Call the Jira API client
         logger.info(f"Creating Jira issue with project_key={project_key}, summary={summary}, issue_type={issue_type}")
+          # Add detailed logging for assignee
+        if "assignee" in additional_fields:
+            assignee_value = additional_fields["assignee"]
+            logger.info(f"Using assignee value: {assignee_value}")            
+            # Check if we have the correct format for cloud instances
+            if client.is_cloud and isinstance(assignee_value, str):                
+                if '@' in assignee_value:
+                    logger.info("Using email address for assignee in Jira Cloud")
+                # Case 1: Standard UUID format with dashes
+                elif len(assignee_value) > 20 and '-' in assignee_value and assignee_value.count('-') >= 4:
+                    logger.info("Using standard UUID format account ID for assignee in Jira Cloud")
+                # Case 2: Numeric Atlassian account ID format
+                elif assignee_value.startswith("5") and len(assignee_value) > 10 and all(c.isdigit() for c in assignee_value):
+                    logger.info(f"Using numeric Atlassian account ID format for assignee: {assignee_value}")
+                # Case 3: Non-standard alphanumeric account ID format without dashes
+                elif len(assignee_value) > 10 and all(c.isalnum() for c in assignee_value):
+                    logger.info(f"Using non-standard alphanumeric account ID format for assignee: {assignee_value}")
+                else:
+                    # Try to resolve this string to an account ID
+                    logger.warning(f"Attempting to resolve assignee value '{assignee_value}' to a valid account ID")
+                    account_id = client.find_user_account_id(assignee_value)
+                    
+                    if account_id:
+                        # Replace with valid account ID
+                        additional_fields["assignee"] = account_id
+                        logger.info(f"Successfully resolved '{assignee_value}' to account ID: {account_id}")
+                    else:
+                        logger.error(f"CRITICAL ERROR: Invalid assignee value '{assignee_value}' for Jira Cloud")
+                        logger.error("For Jira Cloud, assignee must be an email address or a valid account ID")
+                        # For safety, remove the invalid assignee value to prevent API errors
+                        logger.warning("Removing invalid assignee to prevent API errors")
+                        del additional_fields["assignee"]
+        
         result = client.create_issue(
             project_key=project_key,
             summary=summary,
@@ -1306,8 +1711,7 @@ def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
             description=description,
             additional_fields=additional_fields
         )
-        
-        # Format response to include all important information
+          # Format response to include all important information
         if "key" in result:
             return {
                 "success": True,
@@ -1320,7 +1724,20 @@ def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
                 "assignee": entities.get("assignee")
             }
         
+        # Check for specific error types to provide better feedback
+        if isinstance(result, dict) and "error" in result:
+            error_msg = result["error"]
+            # Check for assignee-related errors 
+            if "assignee" in error_msg.lower():
+                # Provide more specific error message for assignee problems
+                return {
+                    "success": False,
+                    "error": f"Failed to create Jira issue: {error_msg}",
+                    "details": "The assignee value was not accepted by Jira. For Jira Cloud, you must use a valid account ID, email address, or username that can be resolved to an account ID."
+                }
+            
+        # Return the original result for other cases
         return result
     except Exception as e:
         logger.error(f"Error in create_jira_issue: {str(e)}", exc_info=True)
-        return {"error": str(e)} 
+        return {"error": str(e)}
