@@ -33,6 +33,12 @@ let chatHistory = [];
 let isAuthenticated = false;
 let currentUser = null;
 
+// Server settings
+let serverSettings = {
+  DEFAULT_JIRA_PROJECT_KEY: 'JCAI', // Default fallback
+  JIRA_URL: 'https://your-domain.atlassian.net'
+};
+
 // Input suggestions based on context
 const inputSuggestions = {
   default: [
@@ -73,6 +79,9 @@ document.addEventListener('DOMContentLoaded', () => {
   // Check authentication status
   checkAuthStatus();
   
+  // Load server settings
+  loadServerSettings();
+  
   // Load chat history
   loadChatHistory();
   
@@ -107,7 +116,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Load settings from storage
 function loadSettings() {
-  chrome.storage.local.get(['serverUrl', 'notificationsEnabled', 'isAuthenticated'], (data) => {
+  chrome.storage.local.get(['serverUrl', 'notificationsEnabled', 'isAuthenticated', 'serverSettings'], (data) => {
     if (data.serverUrl) {
       serverUrlInput.value = data.serverUrl;
     }
@@ -118,6 +127,32 @@ function loadSettings() {
     }
     
     isAuthenticated = data.isAuthenticated || false;
+    
+    // Load server settings if available
+    if (data.serverSettings) {
+      serverSettings = {...serverSettings, ...data.serverSettings};
+    }
+  });
+}
+
+// Load server settings from the server
+function loadServerSettings() {
+  chrome.runtime.sendMessage({
+    type: 'API_REQUEST',
+    endpoint: '/api/settings',
+    method: 'GET'
+  }, (response) => {
+    if (response.success && response.data.settings) {
+      // Store in local variable
+      serverSettings = {...serverSettings, ...response.data.settings};
+      
+      // Store in chrome storage
+      chrome.storage.local.set({
+        serverSettings: response.data.settings
+      });
+      
+      console.log('Server settings loaded', serverSettings);
+    }
   });
 }
 
@@ -528,6 +563,9 @@ async function sendMessage() {
     addMessage('bot', 'Please log in with Jira to use the chatbot. Go to the Settings tab to log in.');
     return;
   }
+
+  // Check if this is a Jira issue creation request (pattern matching before sending to API)
+  let isJiraCreationRequest = /create.*task|create.*issue|add.*task|add.*issue|new.*task|new.*issue/i.test(message.toLowerCase());
   
   try {
     // Prepare message with context
@@ -535,34 +573,76 @@ async function sendMessage() {
       text: message,
       context: currentJiraContext
     };
-    
-    // Send to API
-      chrome.runtime.sendMessage({
-        type: 'API_REQUEST',
-      endpoint: '/api/chat',
-        method: 'POST',
-      data: messageData
-    }, (response) => {
+
+    // If it appears to be a Jira creation request, check if we have enough information
+    if (isJiraCreationRequest && !message.includes("project key")) {
+      // First check if we can extract key details
+      const summaryMatch = message.match(/summary.*?[:"']([^"']+)[:"']/i) || 
+                         message.match(/title.*?[:"']([^"']+)[:"']/i);
+      const descriptionMatch = message.match(/description.*?[:"']([^"']+)[:"']/i) ||
+                              message.match(/details.*?[:"']([^"']+)[:"']/i);
+
+      // If we don't have at least a summary, ask for complete information
+      if (!summaryMatch) {
         // Remove typing indicator
-      typingIndicator.remove();
-        
-      if (response.success) {
-        // Add bot response to UI
-          addMessage('bot', response.data.response);
-          
-        // Handle actions if any
-        if (response.data.actions) {
-          handleActions(response.data.actions);
-        }
-      } else {
-        // Add error message to UI
-        addMessage('bot', `Sorry, I couldn't process your request. ${response.error}`);
-        
-        // If unauthorized, update auth status
-        if (response.error.includes('401') || response.error.includes('unauthorized')) {
-          checkAuthStatus();
-        }
+        typingIndicator.remove();
+
+        // Provide a template response for creating Jira issues
+        const projectKey = serverSettings.DEFAULT_JIRA_PROJECT_KEY || "JCAI";
+        const templateResponse = `To create a Jira issue, I need some details. You can provide them all at once like this:
+
+Please create a Jira issue with:
+- Summary: [Issue title]
+- Description: [Detailed description]
+- Priority: [High, Medium, or Low]
+- Due date: [Optional date]
+
+I'll use the default project key "${projectKey}" unless you specify another one.`;
+
+        addMessage('bot', templateResponse);
+        return;
       }
+    }
+    
+    // Get the user's email from storage if available
+    chrome.storage.local.get(['userEmail', 'userId'], function(result) {
+      const userEmail = result.userEmail || '';
+      const userId = result.userId || '';
+      
+      // Prepare the request
+      const requestData = {
+        text: message,
+        history: chatHistory,
+        user_id: userId || userEmail  // Add the user ID or email for OAuth authentication
+      };
+      
+      // Log the request for debugging
+      console.log('Sending message to server:', requestData);
+      
+      // Send the request
+      fetch(serverUrlInput.value + '/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestData),
+      })
+        .then(response => {
+          // Check for network errors
+          if (!response.ok) {
+            throw new Error(`Server error: ${response.status} ${response.statusText}`);
+          }
+          return response.json();
+        })
+        .then(data => {
+          // Handle the response
+          handleChatResponse(data, typingIndicator);
+        })
+        .catch(error => {
+          // Handle errors
+          console.error('Error:', error);
+          updateMessage(typingIndicator, `<p>Error: ${error.message}</p>`);
+        });
     });
   } catch (error) {
     // Remove typing indicator
@@ -613,42 +693,90 @@ async function getCurrentTabInfo() {
 
 // Handle suggested actions
 function handleActions(actions) {
-  // Remove existing actions
-  const existingActions = document.getElementById('suggested-actions');
-  if (existingActions) {
-    existingActions.remove();
+  if (!actions || !Array.isArray(actions) || actions.length === 0) {
+    return;
   }
   
-  // Create actions container
+  // Create action buttons container
   const actionsDiv = document.createElement('div');
-  actionsDiv.id = 'suggested-actions';
-  actionsDiv.className = 'suggested-actions';
+  actionsDiv.className = 'message-actions';
   
-  // Add heading
-  const heading = document.createElement('div');
-  heading.className = 'actions-heading';
-  heading.textContent = 'Suggested Actions:';
-  actionsDiv.appendChild(heading);
-  
-  // Create buttons for each action
+  // Add action buttons
   actions.forEach(action => {
+    // Create the button
     const button = document.createElement('button');
     button.className = 'action-button';
     button.textContent = action.text;
     
+    // Add click handler based on action type
     if (action.url) {
-      // Open URL action
-      button.onclick = () => {
+      // External URL action
+      button.addEventListener('click', () => {
         chrome.tabs.create({ url: action.url });
-      };
-    } else if (action.action) {
-      // Custom action
-      button.onclick = () => {
-        // Handle different action types
-        // ...
-      };
+      });
+    } else if (action.action === 'create_task') {
+      // Create task action
+      button.addEventListener('click', () => {
+        // Normalize between title and summary
+        const entities = action.params || {};
+        if (entities.title && !entities.summary) {
+          entities.summary = entities.title;
+        } else if (entities.summary && !entities.title) {
+          entities.title = entities.summary;
+        }
+        
+        // Extract all available fields
+        const taskData = {
+          project_key: entities.project_key || serverSettings.DEFAULT_JIRA_PROJECT_KEY,
+          summary: entities.summary || entities.title || "Task created via chatbot",
+          description: entities.description || "",
+          issue_type: entities.issue_type || "Task",
+          priority: entities.priority || "Medium"
+        };
+        
+        // Add optional fields if present
+        if (entities.assignee) taskData.assignee = entities.assignee;
+        if (entities.due_date) taskData.due_date = entities.due_date;
+        if (entities.labels) taskData.labels = entities.labels;
+        
+        // Call the create function
+        createJiraIssue(taskData);
+      });
+    } else if (action.action === 'transition') {
+      // Transition task action
+      button.addEventListener('click', () => {
+        chrome.runtime.sendMessage({
+          type: 'API_REQUEST',
+          endpoint: `/api/jira/tasks/${action.params.task_id}/transition`,
+          method: 'POST',
+          data: {
+            id: action.params.transition_id
+          }
+        }, (response) => {
+          if (response.success) {
+            addMessage('bot', `✅ Successfully moved ${action.params.task_id} to ${action.params.transition_name}`);
+          } else {
+            addMessage('bot', `❌ Failed to update status: ${response.error || "Unknown error"}`);
+          }
+        });
+      });
+    } else {
+      // Generic action (handled by extension)
+      button.addEventListener('click', () => {
+        // Pass action to handler function
+        chrome.runtime.sendMessage({
+          type: 'HANDLE_ACTION',
+          action: action.action,
+          params: action.params
+        }, (response) => {
+          if (response && response.message) {
+            addMessage('bot', response.message);
+          }
+        });
+      });
     }
     
+    // Add button to container
     actionsDiv.appendChild(button);
   });
   
@@ -657,6 +785,125 @@ function handleActions(actions) {
   
   // Scroll to bottom
   chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Create a Jira issue based on extracted entities
+function createJiraIssue(entities) {
+  // Create a new message element for response
+  const loadingMessageElement = document.createElement('div');
+  loadingMessageElement.className = 'message bot-message';
+  loadingMessageElement.innerHTML = '<div class="message-content">Creating Jira issue...</div>';
+  chatMessages.appendChild(loadingMessageElement);
+
+  // Scroll to bottom
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  
+  // Use default project key if not specified
+  const projectKey = entities.project_key || serverSettings?.DEFAULT_JIRA_PROJECT_KEY || 'JCAI';
+  
+  // Ensure required fields are present
+  if (!entities.summary && !entities.title) {
+    updateMessage(loadingMessageElement, '❌ Error: Summary/Title is required to create a Jira issue.');
+    return;
+  }
+  
+  // Get the user's email from storage if available
+  chrome.storage.local.get(['userEmail', 'userId'], function(result) {
+    const userEmail = result.userEmail || '';
+    const userId = result.userId || '';
+    
+    // Add user info to entities for OAuth authentication
+    entities.user_id = userId || userEmail;
+    
+    // Normalize title/summary
+    if (!entities.summary && entities.title) {
+      entities.summary = entities.title;
+    } else if (!entities.title && entities.summary) {
+      entities.title = entities.summary;
+    }
+    
+    // Ensure project key is set
+    entities.project_key = projectKey;
+    
+    console.log('Creating Jira issue with entities:', entities);
+    
+    // Send the request
+    fetch(`${serverUrl}/api/jira/tasks`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(entities),
+    })
+      .then(response => {
+        if (!response.ok) {
+          return response.json().then(data => {
+            throw new Error(data.message || `Server error: ${response.status}`);
+          });
+        }
+        return response.json();
+      })
+      .then(data => {
+        // Handle success response
+        if (data.success && data.key) {
+          const issueLink = `${jiraBaseUrl || 'https://your-jira-instance.atlassian.net'}/browse/${data.key}`;
+          let responseMessage = `
+            ✅ Successfully created Jira issue <a href="${issueLink}" target="_blank">${data.key}</a>:<br>
+            <strong>Summary:</strong> ${data.summary || entities.summary}<br>
+            <strong>Project:</strong> ${data.project_key || entities.project_key}<br>
+            <strong>Type:</strong> ${data.issue_type || entities.issue_type || 'Task'}<br>
+          `;
+          
+          // Add optional fields if present
+          if (data.assignee || entities.assignee) {
+            responseMessage += `<strong>Assignee:</strong> ${data.assignee || entities.assignee}<br>`;
+          }
+          
+          if (entities.priority) {
+            responseMessage += `<strong>Priority:</strong> ${entities.priority}<br>`;
+          }
+          
+          if (entities.due_date) {
+            responseMessage += `<strong>Due Date:</strong> ${entities.due_date}<br>`;
+          }
+          
+          updateMessage(loadingMessageElement, responseMessage);
+          
+          // Add success to chat history
+          addChatHistoryItem('system', `Created Jira issue ${data.key}: ${data.summary || entities.summary}`);
+        } else {
+          // Handle unexpected success response format
+          updateMessage(loadingMessageElement, `✅ Jira issue created, but response format was unexpected: ${JSON.stringify(data)}`);
+        }
+      })
+      .catch(error => {
+        // Handle error
+        console.error('Error creating Jira issue:', error);
+        
+        // Create retry button
+        const retryButton = document.createElement('button');
+        retryButton.textContent = 'Retry';
+        retryButton.className = 'retry-button';
+        retryButton.onclick = function() {
+          // Replace error message with loading
+          updateMessage(loadingMessageElement, 'Retrying Jira issue creation...');
+          // Try again
+          setTimeout(() => createJiraIssue(entities), 500);
+        };
+        
+        // Update with error message and retry button
+        updateMessage(
+          loadingMessageElement, 
+          `❌ Error creating Jira issue: ${error.message} <div class="retry-container"></div>`
+        );
+        
+        // Add the retry button
+        loadingMessageElement.querySelector('.retry-container').appendChild(retryButton);
+        
+        // Add failure to chat history
+        addChatHistoryItem('system', `Failed to create Jira issue: ${error.message}`);
+      });
+  });
 }
 
 // Load tasks from API
@@ -969,4 +1216,18 @@ function displayReminders(reminders) {
     
     remindersList.appendChild(reminderItem);
   });
+}
+
+// Update an existing message element
+function updateMessage(messageElement, newText) {
+  if (!messageElement) return;
+  
+  // Find the message content element
+  const contentElement = messageElement.querySelector('.message-content');
+  if (contentElement) {
+    contentElement.innerHTML = newText;
+  }
+  
+  // Scroll to bottom
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 } 

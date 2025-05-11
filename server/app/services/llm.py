@@ -199,44 +199,195 @@ class OpenRouterClient:
                         ],
                         "usage": {"total_tokens": 0}
                     }
-                    result = fallback_response
                 
-                # Cache the successful response if caching is enabled
+                    # Cache the fallback response if caching is enabled
+                    if use_cache:
+                        self._save_to_cache(model, messages, json.dumps(fallback_response), 0, cache_ttl_hours)
+                    
+                    return fallback_response
+                
+                # Extract token usage
+                tokens_used = result.get("usage", {}).get("total_tokens", 0)
+                
+                # Cache the response if caching is enabled
                 if use_cache:
-                    try:
-                        # Extract the text response
-                        text_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        # Get tokens used if available
-                        tokens_used = result.get("usage", {}).get("total_tokens", 0)
-                        # Save to cache
-                        self._save_to_cache(
-                            model=model,
-                            messages=messages,
-                            response=json.dumps(result),
-                            tokens_used=tokens_used,
-                            ttl_hours=cache_ttl_hours
-                        )
-                    except Exception as e:
-                        logger.error(f"Error caching response: {str(e)}")
+                    self._save_to_cache(model, messages, json.dumps(result), tokens_used, cache_ttl_hours)
                 
                 return result
                 
             except requests.exceptions.RequestException as e:
-                logger.error(f"Request error: {str(e)}")
+                logger.error(f"OpenRouter API request error: {str(e)}")
                 
                 # Check if we should retry
                 retries += 1
                 if retries > self.max_retries:
-                    logger.error(f"Max retries ({self.max_retries}) exceeded")
-                    raise
+                    logger.error(f"Max retries ({self.max_retries}) exceeded for OpenRouter API request")
+                    
+                    # Return a fallback response
+                    fallback_response = {
+                        "id": f"fallback_{int(time.time())}",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "I'm sorry, but I'm having trouble connecting to the language model service right now. Please try again later."
+                                },
+                                "index": 0,
+                                "finish_reason": "error"
+                            }
+                        ],
+                        "usage": {"total_tokens": 0}
+                    }
+                    
+                    return fallback_response
                 
-                # Calculate backoff delay (exponential with jitter)
-                delay = current_delay * (1.0 + 0.2 * random.random())
-                logger.info(f"Retrying in {delay:.2f} seconds (attempt {retries}/{self.max_retries})")
-                time.sleep(delay)
+                # Exponential backoff
+                logger.info(f"Retrying in {current_delay} seconds (attempt {retries}/{self.max_retries})")
+                time.sleep(current_delay)
                 
-                # Increase delay for next attempt
-                current_delay *= 2
+                # Increase delay for next attempt with some randomness to avoid thundering herd
+                current_delay = min(60, current_delay * 2 * (0.5 + random.random()))
+    
+    def chat_completion_sync(self, 
+                      messages: List[Dict[str, str]], 
+                      model: Optional[str] = None,
+                      temperature: float = 0.7,
+                      max_tokens: Optional[int] = None,
+                      use_cache: bool = True,
+                      cache_ttl_hours: int = 24,
+                      stream: bool = False) -> Dict[str, Any]:
+        """
+        Synchronous version of chat_completion for use in non-async contexts.
+        
+        This method has the same functionality as chat_completion but can be 
+        called from synchronous code like process_user_input.
+        
+        Args:
+            messages: List of message objects with 'role' and 'content'
+            model: Model to use (defaults to self.default_model)
+            temperature: Sampling temperature (0-1)
+            max_tokens: Maximum tokens to generate
+            use_cache: Whether to use caching
+            cache_ttl_hours: How long to cache the response
+            stream: Whether to stream the response
+            
+        Returns:
+            Response from the API or cached response
+        """
+        # Use default model if none provided
+        if not model:
+            model = self.default_model
+        
+        # Check cache first if enabled
+        if use_cache and not stream:
+            cached_response = self._check_cache(model, messages)
+            if cached_response:
+                return json.loads(cached_response)
+        
+        # Prepare the request payload
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": stream
+        }
+        
+        # Add max_tokens if provided
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        
+        # Prepare for retries
+        retries = 0
+        current_delay = self.retry_delay
+        
+        while True:
+            try:
+                logger.debug(f"Sending request to OpenRouter: {model}")
+                
+                # Make the API request
+                response = requests.post(
+                    f"{self.BASE_URL}{self.CHAT_ENDPOINT}",
+                    headers=self.headers,
+                    json=payload,
+                    stream=stream,
+                    timeout=60  # 60-second timeout
+                )
+                
+                # Raise an exception for HTTP errors
+                response.raise_for_status()
+                
+                if stream:
+                    return response  # Return the streaming response object
+                
+                # Parse the JSON response
+                result = response.json()
+                
+                # Verify the response contains the expected data
+                if "choices" not in result or not result["choices"]:
+                    logger.error(f"Invalid response from OpenRouter API: missing 'choices' field: {result}")
+                    # Create a fallback response
+                    fallback_response = {
+                        "id": f"fallback_{int(time.time())}",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "I'm sorry, but I encountered an issue processing your request. Could you please try again or rephrase your question?"
+                                },
+                                "index": 0,
+                                "finish_reason": "error"
+                            }
+                        ],
+                        "usage": {"total_tokens": 0}
+                    }
+                    
+                    # Cache the fallback response if caching is enabled
+                    if use_cache:
+                        self._save_to_cache(model, messages, json.dumps(fallback_response), 0, cache_ttl_hours)
+                    
+                    return fallback_response
+                
+                # Extract token usage
+                tokens_used = result.get("usage", {}).get("total_tokens", 0)
+                
+                # Cache the response if caching is enabled
+                if use_cache:
+                    self._save_to_cache(model, messages, json.dumps(result), tokens_used, cache_ttl_hours)
+                
+                return result
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"OpenRouter API request error: {str(e)}")
+                
+                # Check if we should retry
+                retries += 1
+                if retries > self.max_retries:
+                    logger.error(f"Max retries ({self.max_retries}) exceeded for OpenRouter API request")
+                    
+                    # Return a fallback response
+                    fallback_response = {
+                        "id": f"fallback_{int(time.time())}",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "I'm sorry, but I'm having trouble connecting to the language model service right now. Please try again later."
+                                },
+                                "index": 0,
+                                "finish_reason": "error"
+                            }
+                        ],
+                        "usage": {"total_tokens": 0}
+                    }
+                    
+                    return fallback_response
+                
+                # Exponential backoff
+                logger.info(f"Retrying in {current_delay} seconds (attempt {retries}/{self.max_retries})")
+                time.sleep(current_delay)
+                
+                # Increase delay for next attempt with some randomness to avoid thundering herd
+                current_delay = min(60, current_delay * 2 * (0.5 + random.random()))
     
     def get_max_token_limit(self, model: Optional[str] = None) -> int:
         """

@@ -30,6 +30,9 @@ chrome.runtime.onInstalled.addListener(() => {
   
   // Start reminder checks
   startReminderChecks();
+  
+  // Load server settings
+  loadServerSettings();
 });
 
 // Listen for messages from content scripts or popup
@@ -428,7 +431,7 @@ async function initiateLogin() {
     chrome.storage.local.set({ 'oauth_state': authState });
     
     const serverUrl = await getServerUrl();
-    const loginUrl = `${serverUrl}/api/auth/login`;
+    const loginUrl = `${serverUrl}/auth/login`;
     
     // Open a new tab with the login URL
     chrome.tabs.create({ url: loginUrl });
@@ -444,7 +447,7 @@ async function initiateLogin() {
 async function logout() {
   try {
     const serverUrl = await getServerUrl();
-    const logoutUrl = `${serverUrl}/api/auth/logout`;
+    const logoutUrl = `${serverUrl}/auth/logout`;
     
     // Call the logout API
     await fetch(logoutUrl, { 
@@ -466,7 +469,7 @@ async function logout() {
 async function checkAuthStatus() {
   try {
     const serverUrl = await getServerUrl();
-    const statusUrl = `${serverUrl}/api/auth/status`;
+    const statusUrl = `${serverUrl}/auth/status`;
     
     // Call the status API
     const response = await fetch(statusUrl, { 
@@ -496,7 +499,7 @@ async function checkAuthStatus() {
 async function refreshAuth() {
   try {
     const serverUrl = await getServerUrl();
-    const refreshUrl = `${serverUrl}/api/auth/refresh-token`;
+    const refreshUrl = `${serverUrl}/auth/refresh-token`;
     
     // Call the refresh token API
     const response = await fetch(refreshUrl, { 
@@ -520,3 +523,22 @@ async function refreshAuth() {
 checkAuthStatus().then(status => {
   console.log('Initial auth status:', status.authenticated ? 'Authenticated' : 'Not authenticated');
 });
+
+// Load settings from the server
+async function loadServerSettings() {
+  try {
+    console.log('Loading server settings...');
+    const response = await handleApiRequest('/api/settings');
+    
+    if (response && response.settings) {
+      // Store settings in local storage
+      chrome.storage.local.set({
+        serverSettings: response.settings
+      });
+      
+      console.log('Server settings loaded:', response.settings);
+    }
+  } catch (error) {
+    console.error('Failed to load server settings:', error);
+  }
+}

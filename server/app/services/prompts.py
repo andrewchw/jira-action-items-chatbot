@@ -93,19 +93,40 @@ class JiraPrompts:
 
     TEXT: "{text}"
 
+    The default project key is: {default_project_key}
+
     Return the following information in a structured JSON format:
     - summary: A concise title for the issue (required)
     - description: A detailed description of the issue (optional)
     - issue_type: The type of issue (e.g., "Task", "Bug", "Story") (default: "Task")
-    - priority: The priority level (e.g., "High", "Medium", "Low") (default: "Medium")
+    - priority: The priority level (MUST be one of these exact values: "Highest", "High", "Medium", "Low", "Lowest") (default: "Medium")
     - assignee: The username of the person to assign the issue to (optional)
-    - due_date: The due date in YYYY-MM-DD format (optional)
+    - due_date: The due date in YYYY-MM-DD format (optional). For day names (like "Friday"), just extract the day name.
     - labels: A list of labels/tags (optional)
+    - project_key: The project key for the issue (default: {default_project_key})
 
-    Only extract information that is explicitly mentioned in the text. Do not make assumptions or add information not present in the text.
+    Only extract information that is explicitly mentioned in the text. When the project key is not specified, use the default project key.
+    Do not make assumptions or add information not present in the text except for the default values mentioned.
 
-    Format your response as a valid JSON object with only the fields mentioned above.
-    """, ["text"])
+    IMPORTANT NOTES:
+    1. For priority, use EXACTLY one of: "Highest", "High", "Medium", "Low", "Lowest" with the first letter capitalized.
+    2. For issue_type, the first letter should be capitalized (e.g., "Task", "Bug", "Story").
+    3. Specify project_key as the exact Jira project key (e.g., "JCAI").
+
+    Format your response as a valid JSON object with only the fields mentioned above that have values.
+    Do not include null values or empty strings. Return ONLY the JSON object without any explanation or extra text.
+    
+    Example response format:
+    ```json
+    {{
+      "summary": "Create login page",
+      "description": "Implement a user-friendly login page with email and password fields",
+      "issue_type": "Task",
+      "priority": "High",
+      "project_key": "JCAI"
+    }}
+    ```
+    """, ["text", "default_project_key"])
 
     # Template for extracting entities from text for Jira issue updates
     UPDATE_ISSUE_EXTRACT = PromptTemplate("""
@@ -277,6 +298,7 @@ You should respond to natural language requests about creating, updating, and tr
             "Priority: {priority}\nAssignee: {assignee}\n{additional_fields}",
             ["title", "project_key"]  # Only require title and project_key
         ),
+        "CREATE_ISSUE_EXTRACT": JiraPrompts.CREATE_ISSUE_EXTRACT,
         "update_task": PromptTemplate(
             "Update Jira task {task_id} with the following changes:\n{changes}",
             ["task_id", "changes"]
@@ -460,7 +482,7 @@ You should respond to natural language requests about creating, updating, and tr
         has_task_id = "task_id" in entities
 
         # Check for task creation intent
-        if any(word in normalized_text for word in ["create", "add", "new"]) and any(
+        if any(word in normalized_text for word in ["create", "add", "make", "new"]) and any(
                 word in normalized_text for word in cls.keywords["task_objects"]):
             return "create_task"
         
@@ -568,52 +590,172 @@ You should respond to natural language requests about creating, updating, and tr
     @classmethod
     def process_user_input(cls, text: str) -> Dict[str, Any]:
         """
-        Process user input text to identify intent and extract entities.
+        Process user input to determine intent and extract entities.
         
         Args:
             text: User input text
             
         Returns:
-            Dictionary with processed data:
-            - intent: Identified intent
-            - entities: Extracted entities
-            - messages: LLM messages for the intent
+            Dict with intent, entities, and messages
         """
+        # Normalize the text
+        normalized_text = cls._normalize_text(text)
+        
         # Extract entities from the text
-        entities = cls.extract_entities(text)
+        entities = cls.extract_entities(normalized_text)
         
-        # Detect the intent from the text
-        intent = cls.detect_intent(text)
+        # Detect intent
+        intent = cls.detect_intent(normalized_text)
         
-        # Set default values for commonly used fields
-        if "description" not in entities:
-            entities["description"] = "No description provided"
+        # Apply special processing based on intent
+        if intent == "create_task":
+            from app.core.config import settings
+            # Use the OpenRouter API to extract structured information
+            client = OpenRouterClient()
             
-        if "filter_clause" not in entities:
-            entities["filter_clause"] = "for the current user"
+            # Make sure DEFAULT_JIRA_PROJECT_KEY is available
+            default_project_key = settings.DEFAULT_JIRA_PROJECT_KEY
+            if not default_project_key:
+                logger.warning("DEFAULT_JIRA_PROJECT_KEY not set in environment variables, using 'JCAI' as fallback")
+                default_project_key = "JCAI"
             
-        if "assignee" not in entities:
-            entities["assignee"] = "current user"
-            
-        if "comment" not in entities:
-            entities["comment"] = ""
-            
-        if "additional_instructions" not in entities:
-            entities["additional_instructions"] = ""
-            
-        if "additional_fields" not in entities:
-            entities["additional_fields"] = ""
-            
-        if "status_filter" not in entities:
-            entities["status_filter"] = ""
-            
-        # If project_key is not provided but we need it (create task intent),
-        # use the default project key from settings
-        if intent == "create_task" and "project_key" not in entities:
-            entities["project_key"] = settings.DEFAULT_JIRA_PROJECT_KEY
-            logger.info(f"Using default project key: {entities['project_key']}")
-
-        # Build the messages for the LLM
+            # Make sure JiraPrompts.CREATE_ISSUE_EXTRACT is properly initialized
+            try:
+                prompt = JiraPrompts.CREATE_ISSUE_EXTRACT.format(
+                    text=normalized_text,
+                    default_project_key=default_project_key
+                )
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant that extracts structured information from text."},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                # Use the synchronous version of chat_completion
+                logger.debug(f"Sending entity extraction request to LLM for task creation")
+                response = client.chat_completion_sync(messages)
+                response_text = response["choices"][0]["message"]["content"]
+                logger.debug(f"Received entity extraction response: {response_text[:100]}...")
+                
+                # Try to parse JSON from the response
+                try:
+                    # First try to extract JSON if it's embedded in markdown code blocks
+                    json_str = ""
+                    if "```json" in response_text:
+                        json_str = response_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in response_text:
+                        json_str = response_text.split("```")[1].strip()
+                    else:
+                        # Try to find a JSON object in the text
+                        import re
+                        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group(0)
+                        else:
+                            json_str = response_text
+                    
+                    # Clean and parse the JSON
+                    json_str = json_str.strip()
+                    logger.debug(f"Extracted JSON string: {json_str[:100]}...")
+                    
+                    extracted_entities = json.loads(json_str)
+                    logger.info(f"Successfully parsed JSON with entities: {extracted_entities}")
+                    
+                    # Update entities with extracted data
+                    entities.update(extracted_entities)
+                    
+                    # Add original query for reference
+                    entities["original_query"] = normalized_text
+                    
+                    # Ensure project_key is set
+                    if "project_key" not in entities or not entities["project_key"]:
+                        entities["project_key"] = default_project_key
+                        logger.debug(f"Using default project key: {default_project_key}")
+                    
+                    # Normalize between title and summary fields
+                    if "summary" in entities and "title" not in entities:
+                        entities["title"] = entities["summary"]
+                        logger.debug(f"Copying 'summary' to 'title' field: {entities['summary']}")
+                    elif "title" in entities and "summary" not in entities:
+                        entities["summary"] = entities["title"]
+                        logger.debug(f"Copying 'title' to 'summary' field: {entities['title']}")
+                    elif "summary" not in entities and "title" not in entities:
+                        # Try to extract a summary from the text if not provided
+                        # Just use the first sentence or first 50 chars
+                        first_sentence = normalized_text.split('.')[0].strip()
+                        entities["summary"] = first_sentence[:50] + ("..." if len(first_sentence) > 50 else "")
+                        entities["title"] = entities["summary"]
+                        logger.debug(f"Created default summary/title: {entities['summary']}")
+                    
+                    # Ensure other required fields have defaults
+                    if "issue_type" not in entities:
+                        entities["issue_type"] = "Task"
+                    
+                    if "priority" not in entities:
+                        entities["priority"] = "Medium"
+                    
+                    logger.debug(f"Final extracted entities for task creation: {entities}")
+                    
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"Error parsing JSON from LLM response: {str(json_err)}")
+                    logger.error(f"Raw response: {response_text[:200]}...")
+                    
+                    # Try a different approach with simpler regex parsing
+                    try:
+                        import re
+                        
+                        # Look for key-value pairs in the response
+                        summary_match = re.search(r'"summary":\s*"([^"]+)"', response_text)
+                        if summary_match:
+                            entities["summary"] = summary_match.group(1)
+                            entities["title"] = entities["summary"]
+                        
+                        description_match = re.search(r'"description":\s*"([^"]+)"', response_text)
+                        if description_match:
+                            entities["description"] = description_match.group(1)
+                        
+                        issue_type_match = re.search(r'"issue_type":\s*"([^"]+)"', response_text)
+                        if issue_type_match:
+                            entities["issue_type"] = issue_type_match.group(1)
+                        
+                        priority_match = re.search(r'"priority":\s*"([^"]+)"', response_text)
+                        if priority_match:
+                            entities["priority"] = priority_match.group(1)
+                        
+                        assignee_match = re.search(r'"assignee":\s*"([^"]+)"', response_text)
+                        if assignee_match:
+                            entities["assignee"] = assignee_match.group(1)
+                        
+                        logger.info(f"Extracted entities using regex fallback: {entities}")
+                    except Exception as regex_err:
+                        logger.error(f"Error with regex extraction: {str(regex_err)}")
+                        
+                        # Add fallback title/summary if not present
+                        if "summary" not in entities and "title" not in entities:
+                            entities["summary"] = "Task created via chatbot"
+                            entities["title"] = entities["summary"]
+                        elif "summary" in entities and "title" not in entities:
+                            entities["title"] = entities["summary"]
+                        elif "title" in entities and "summary" not in entities:
+                            entities["summary"] = entities["title"]
+                
+            except Exception as e:
+                logger.error(f"Error extracting entities with LLM: {str(e)}")
+                # Add fallback information
+                entities["needs_more_info"] = True
+                entities["default_project_key"] = default_project_key
+                
+                # Add fallback title/summary if not present
+                if "summary" not in entities and "title" not in entities:
+                    entities["summary"] = "Task created via chatbot"
+                    entities["title"] = entities["summary"]
+                elif "summary" in entities and "title" not in entities:
+                    entities["title"] = entities["summary"]
+                elif "title" in entities and "summary" not in entities:
+                    entities["summary"] = entities["title"]
+        
+        # Add special processing for other intents here as needed
+        
+        # Build the messages for the API request
         messages = cls.build_messages(intent, entities)
         
         return {

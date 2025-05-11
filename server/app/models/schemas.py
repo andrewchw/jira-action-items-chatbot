@@ -10,6 +10,7 @@ class ChatMessage(BaseModel):
     text: str = Field(..., description="The message text content")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
     context: Optional[Dict] = Field(None, description="Additional context data")
+    history: Optional[List[Dict]] = Field(default_factory=list, description="Previous conversation history")
 
 class ChatResponse(BaseModel):
     """

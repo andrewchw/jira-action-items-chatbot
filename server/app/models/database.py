@@ -5,6 +5,8 @@ from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, Foreign
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from app.core.config import settings
+import json
+from sqlalchemy.sql import or_, func
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -84,6 +86,22 @@ class UserConfig(Base):
     jira_refresh_token = Column(String(2048), nullable=True)
     jira_token_expires_at = Column(DateTime, nullable=True)
     jira_user_info = Column(Text, nullable=True)  # JSON string of user info from Jira
+
+class JiraUserCache(Base):
+    """
+    Cache for Jira user information to avoid frequent API calls for user lookup.
+    """
+    __tablename__ = "jira_user_cache"
+    
+    id = Column(Integer, primary_key=True)
+    account_id = Column(String, index=True, unique=True)  # Jira account ID
+    username = Column(String, index=True)  # Jira username
+    display_name = Column(String, index=True)  # User's display name
+    email = Column(String, index=True)  # User's email
+    avatar_url = Column(String, nullable=True)  # URL to user's avatar
+    active = Column(Boolean, default=True)  # Whether the user is active
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow) 
+    raw_data = Column(Text, nullable=True)  # Raw JSON data from Jira
 
 # Database connection
 class DatabaseManager:
@@ -287,4 +305,116 @@ def get_or_create_user_config(db: Session, user_id: str) -> UserConfig:
         db.add(user_config)
         db.commit()
         db.refresh(user_config)
-    return user_config 
+    return user_config
+
+def update_jira_user_cache(db: Session, user_data: Dict[str, Any]) -> JiraUserCache:
+    """
+    Update or create a Jira user cache entry.
+    
+    Args:
+        db: Database session
+        user_data: User data from Jira API
+        
+    Returns:
+        Updated or created JiraUserCache instance
+    """
+    # Extract key fields
+    account_id = user_data.get("accountId") or user_data.get("account_id")
+    username = user_data.get("name") or user_data.get("username")
+    display_name = user_data.get("displayName") or user_data.get("display_name")
+    email = user_data.get("emailAddress") or user_data.get("email")
+    
+    # Try to find existing record by account_id if available
+    if account_id:
+        user_cache = db.query(JiraUserCache).filter(JiraUserCache.account_id == account_id).first()
+    # Then try by username
+    elif username:
+        user_cache = db.query(JiraUserCache).filter(JiraUserCache.username == username).first()
+    # Then try by email
+    elif email:
+        user_cache = db.query(JiraUserCache).filter(JiraUserCache.email == email).first()
+    else:
+        # Can't find a unique identifier, return None
+        return None
+    
+    # If not found, create new record
+    if not user_cache:
+        user_cache = JiraUserCache(
+            account_id=account_id,
+            username=username,
+            display_name=display_name,
+            email=email,
+            avatar_url=user_data.get("avatarUrls", {}).get("48x48"),
+            active=user_data.get("active", True),
+            raw_data=json.dumps(user_data)
+        )
+        db.add(user_cache)
+    else:
+        # Update existing record
+        if account_id:
+            user_cache.account_id = account_id
+        if username:
+            user_cache.username = username
+        if display_name:
+            user_cache.display_name = display_name
+        if email:
+            user_cache.email = email
+        if "avatarUrls" in user_data and "48x48" in user_data["avatarUrls"]:
+            user_cache.avatar_url = user_data["avatarUrls"]["48x48"]
+        if "active" in user_data:
+            user_cache.active = user_data["active"]
+        user_cache.raw_data = json.dumps(user_data)
+        user_cache.last_updated = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(user_cache)
+    return user_cache
+
+def get_jira_user_by_name(db: Session, name: str) -> Optional[JiraUserCache]:
+    """
+    Find a Jira user by name, display name, or email.
+    
+    Args:
+        db: Database session
+        name: Name, display name, or email to search for
+        
+    Returns:
+        JiraUserCache instance if found, None otherwise
+    """
+    # Try to match by name, display name, or email using case-insensitive search
+    name_lower = name.lower()
+    return db.query(JiraUserCache).filter(
+        or_(
+            func.lower(JiraUserCache.username) == name_lower,
+            func.lower(JiraUserCache.display_name) == name_lower,
+            func.lower(JiraUserCache.email) == name_lower
+        )
+    ).first()
+
+def bulk_update_jira_users(db: Session, users_data: List[Dict[str, Any]]) -> int:
+    """
+    Bulk update Jira user cache from a list of user data.
+    
+    Args:
+        db: Database session
+        users_data: List of user data from Jira API
+        
+    Returns:
+        Number of users updated or created
+    """
+    count = 0
+    for user_data in users_data:
+        user = update_jira_user_cache(db, user_data)
+        if user:
+            count += 1
+    return count
+
+# Add the create_db_and_tables function
+
+def create_db_and_tables():
+    """
+    Create database tables if they don't exist.
+    """
+    logger.info("Creating database tables if they don't exist")
+    Base.metadata.create_all(bind=db_manager.engine)
+    logger.info("Database tables created successfully") 

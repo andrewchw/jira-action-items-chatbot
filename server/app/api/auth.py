@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, Response, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from typing import Dict, Optional, List, Any
 import logging
 import requests
@@ -44,7 +44,7 @@ async def login(request: Request, response: Response, db: Session = Depends(get_
     )
     
     # Use absolute URI for the redirect
-    redirect_uri = f"{settings.SITE_URL}/api/auth/callback"
+    redirect_uri = f"{settings.SITE_URL}/auth/callback"
     logger.info(f"Using redirect URI: {redirect_uri}")
     
     # Build the authorization URL with full required scopes
@@ -108,7 +108,7 @@ async def oauth_callback(
         )
     
     # Use absolute URI for the redirect, matching the login endpoint
-    redirect_uri = f"{settings.SITE_URL}/api/auth/callback"
+    redirect_uri = f"{settings.SITE_URL}/auth/callback"
     logger.info(f"Using callback redirect URI: {redirect_uri}")
     
     # Exchange the authorization code for an access token
@@ -168,7 +168,9 @@ async def oauth_callback(
             db.commit()
             
             # Set a cookie with the user identifier (use HttpOnly in production)
-            response = RedirectResponse(url=settings.SITE_URL)
+            # Instead of redirecting to root URL, redirect to a success page or chrome-extension URL
+            success_url = f"{settings.SITE_URL}/auth/success?user_id={user_info['account_id']}"
+            response = RedirectResponse(url=success_url)
             response.set_cookie(
                 key="jira_user_id",
                 value=user_info["account_id"],
@@ -368,4 +370,141 @@ async def get_current_user(
     try:
         return json.loads(user_config.jira_user_info)
     except json.JSONDecodeError:
-        return None 
+        return None
+
+def get_oauth_router() -> APIRouter:
+    """
+    Get the OAuth router for authentication with Jira.
+    """
+    return router
+
+def revoke_oauth_token_endpoint() -> APIRouter:
+    """
+    Get the router for revoking OAuth tokens.
+    """
+    revoke_router = APIRouter()
+    
+    @revoke_router.post("/revoke")
+    async def revoke_token(
+        request: Request,
+        db: Session = Depends(get_db)
+    ):
+        """
+        Revoke the current OAuth token
+        """
+        # Get user ID from cookie
+        user_id = request.cookies.get("jira_user_id")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated"
+            )
+        
+        # Get user config
+        user_config = db.query(UserConfig).filter(UserConfig.user_id == user_id).first()
+        
+        if not user_config:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User configuration not found"
+            )
+        
+        # Clear tokens
+        user_config.jira_access_token = None
+        user_config.jira_refresh_token = None
+        db.commit()
+        
+        return {"success": True, "message": "Token revoked successfully"}
+    
+    return revoke_router
+
+@router.get("/success")
+async def auth_success(
+    request: Request,
+    user_id: Optional[str] = None
+):
+    """
+    Show a success page after successful authentication.
+    This page will automatically close and notify the extension.
+    """
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Authentication Successful</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+                margin: 0;
+                background-color: #f5f5f5;
+            }
+            .container {
+                text-align: center;
+                padding: 2rem;
+                background-color: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+                max-width: 500px;
+            }
+            h1 {
+                color: #1a73e8;
+            }
+            .message {
+                margin: 1rem 0;
+                color: #333;
+            }
+            .spinner {
+                border: 4px solid rgba(0, 0, 0, 0.1);
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                border-left-color: #1a73e8;
+                animation: spin 1s linear infinite;
+                margin: 1rem auto;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Authentication Successful!</h1>
+            <div class="spinner"></div>
+            <p class="message">You have successfully authenticated with Jira.</p>
+            <p id="countdown">This window will close automatically in 5 seconds...</p>
+        </div>
+        <script>
+            // Start countdown
+            let seconds = 5;
+            const countdownElement = document.getElementById('countdown');
+            const interval = setInterval(() => {
+                seconds--;
+                countdownElement.textContent = `This window will close automatically in ${seconds} second${seconds !== 1 ? 's' : ''}...`;
+                if (seconds <= 0) {
+                    clearInterval(interval);
+                    // Close the window
+                    window.close();
+                }
+            }, 1000);
+            
+            // Notify extension of successful authentication
+            if (window.chrome && chrome.runtime && chrome.runtime.sendMessage) {
+                chrome.runtime.sendMessage({
+                    type: 'AUTH_SUCCESS',
+                    data: { authenticated: true }
+                });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content) 

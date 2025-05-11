@@ -2,12 +2,14 @@ import os
 import logging
 import json
 import hashlib
+import time
 from typing import Dict, List, Any, Optional, Union, Tuple
 import requests
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.database import get_db, JiraCache, update_jira_cache, get_or_create_user_config, UserConfig
+from app.models.database import get_db, JiraCache, update_jira_cache, get_or_create_user_config, UserConfig, bulk_update_jira_users, get_jira_user_by_name, update_jira_user_cache
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -35,15 +37,38 @@ class JiraClient:
         self.user_id = user_id
         self.access_token = None
         
+        # Validate base URL
         if not self.base_url:
-            logger.warning("Jira URL not set. Jira functionality will be limited.")
+            logger.error("Jira URL not set. Please set JIRA_URL in your environment variables.")
+            self.base_url = "https://your-domain.atlassian.net"  # Fallback URL
         
+        # Check if URL has common format issues and try to fix
+        if not self.base_url.startswith('http'):
+            logger.warning(f"Jira URL does not start with http/https, prepending https://: {self.base_url}")
+            self.base_url = f"https://{self.base_url}"
+            
+        # Remove trailing slash if present
+        if self.base_url.endswith('/'):
+            self.base_url = self.base_url[:-1]
+            
+        # Validate OAuth settings
         if use_oauth and not user_id:
             logger.warning("User ID not provided for OAuth authentication. Falling back to basic auth.")
             self.use_oauth = False
             
-        if not use_oauth and (not self.username or not self.api_token):
-            logger.warning("Jira basic auth credentials not set. Jira functionality will be limited.")
+        # Validate basic auth credentials
+        if not use_oauth:
+            if not self.username:
+                logger.error("Jira username not set. Please set JIRA_USERNAME in your environment variables.")
+            if not self.api_token:
+                logger.error("Jira API token not set. Please set JIRA_API_TOKEN in your environment variables.")
+                
+            if not self.username or not self.api_token:
+                logger.warning("Jira basic auth credentials incomplete. Some functionality will be unavailable.")
+        
+        # Log initialization
+        auth_method = "OAuth" if self.use_oauth else "Basic Auth"
+        logger.info(f"Initializing Jira client for {self.base_url} using {auth_method}")
         
         # Default headers for all requests
         self.headers = {
@@ -57,8 +82,6 @@ class JiraClient:
         
         # Cache settings
         self.default_cache_ttl = 15  # Default cache TTL in minutes
-        
-        logger.info(f"Initialized Jira client for {self.base_url}")
     
     def get_auth(self):
         """
@@ -236,207 +259,270 @@ class JiraClient:
     def _make_request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None,
                      use_cache: bool = True, cache_ttl: int = None) -> Dict:
         """
-        Make a request to the Jira API with retry logic and caching.
+        Make a request to the Jira API.
         
         Args:
             method: HTTP method
             endpoint: API endpoint
-            params: URL parameters
-            data: Request data
-            use_cache: Whether to use caching
-            cache_ttl: Cache TTL in minutes (None for default)
+            params: Query parameters
+            data: Request body data
+            use_cache: Whether to use cache
+            cache_ttl: Cache TTL in minutes
             
         Returns:
-            Response from the API as dictionary
+            Response data
         """
-        # Use default cache TTL if not specified
-        if cache_ttl is None:
-            cache_ttl = self.default_cache_ttl
-        
-        # Generate cache key
-        cache_key = self._generate_cache_key(method, endpoint, params, data)
-        
-        # Return cached response if available
+        # Generate cache key if using cache
+        cache_key = None
         if use_cache and method.upper() == "GET":
-            cached = self._check_jira_cache(cache_key, max_age_minutes=cache_ttl)
-            if cached:
-                return cached
+            cache_key = self._generate_cache_key(method, endpoint, params, data)
+            
+            # Check cache
+            cached_data = self._check_jira_cache(cache_key, cache_ttl or 15)
+            if cached_data:
+                logger.debug(f"Using cached response for {method} {endpoint}")
+                return cached_data
         
-        # Build the full URL
+        # Construct URL
         url = f"{self.base_url}{endpoint}"
         
-        # Prepare for retries
-        retries = 0
-        current_delay = self.retry_delay
+        # Prepare request
+        auth = self.get_auth()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
         
-        while True:
-            try:
-                logger.debug(f"Making Jira API request: {method} {endpoint}")
+        # Log auth type
+        if isinstance(auth, tuple):
+            logger.debug(f"Using Basic authentication for Jira API request with username: {auth[0]}")
+        else:
+            logger.debug("Using OAuth authentication for Jira API request")
+        
+        # Log request details for debugging
+        if data:
+            logger.debug(f"Request data: {json.dumps(data)} ")
+        
+        logger.info(f"Making Jira API request: {method} {url}")
+        
+        # Make request
+        try:
+            if method.upper() == "GET":
+                response = requests.get(url, auth=auth, headers=headers, params=params, timeout=30)
+            elif method.upper() == "POST":
+                response = requests.post(url, auth=auth, headers=headers, params=params, json=data, timeout=30)
+            elif method.upper() == "PUT":
+                response = requests.put(url, auth=auth, headers=headers, params=params, json=data, timeout=30)
+            elif method.upper() == "DELETE":
+                response = requests.delete(url, auth=auth, headers=headers, params=params, timeout=30)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            # Log response status
+            logger.debug(f"Jira API response status: {response.status_code}")
+            logger.debug(f"Jira API response headers: {response.headers}")
+            
+            # Check for errors
+            if response.status_code >= 400:
+                try:
+                    error_data = response.json()
+                    
+                    # Handle both errorMessages array and errors object
+                    if "errorMessages" in error_data and error_data["errorMessages"]:
+                        error_message = error_data["errorMessages"][0]
+                    elif "errors" in error_data and error_data["errors"]:
+                        # For structured error objects, format them
+                        error_parts = []
+                        for field, msg in error_data["errors"].items():
+                            error_parts.append(f"{field}: {msg}")
+                        error_message = ", ".join(error_parts)
+                    else:
+                        error_message = f"HTTP error {response.status_code}"
+                        
+                    logger.error(f"Jira API error: {response.status_code} - {json.dumps(error_data)}")
+                    raise ValueError(error_message)
+                except ValueError as ve:
+                    # Re-raise the formatted error
+                    raise ve
+                except Exception as e:
+                    # Handle JSON parsing errors
+                    logger.error(f"Error parsing Jira API error response: {str(e)}")
+                    raise ValueError(f"HTTP error {response.status_code}: {response.text}")
+            
+            # Parse response
+            if response.content:
+                response_data = response.json()
                 
-                # Set up authentication
-                headers = self.headers.copy()
-                auth = None
+                # Cache response if appropriate
+                if cache_key and method.upper() == "GET":
+                    self._save_to_jira_cache(cache_key, response_data)
                 
-                if self.use_oauth and self.access_token:
-                    # Use OAuth token in Authorization header
-                    headers["Authorization"] = f"Bearer {self.access_token}"
-                else:
-                    # Use basic auth
-                    auth = self.get_auth()
-                
-                # Make the request
-                response = requests.request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=data,
-                    headers=headers,
-                    auth=auth,
-                    timeout=30
-                )
-                
-                # Raise an exception for HTTP errors
-                response.raise_for_status()
-                
-                # Parse the JSON response
-                result = response.json()
-                
-                # Cache GET responses if caching is enabled
-                if use_cache and method.upper() == "GET":
-                    self._save_to_jira_cache(cache_key, result)
-                
-                return result
-                
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Jira API request error: {str(e)}")
-                
-                # Check if we should retry
-                retries += 1
-                if retries > self.max_retries:
-                    logger.error(f"Max retries ({self.max_retries}) exceeded for Jira API request")
-                    raise
-                
-                # Exponential backoff
-                logger.info(f"Retrying in {current_delay} seconds (attempt {retries}/{self.max_retries})")
-                import time
-                time.sleep(current_delay)
-                
-                # Increase delay for next attempt
-                current_delay *= 2
+                return response_data
+            else:
+                return {"success": True}
+            
+        except ValueError as e:
+            # Re-raise value errors (validation errors)
+            raise
+        except Exception as e:
+            # Handle other errors
+            logger.error(f"Error making Jira API request: {str(e)}")
+            raise ValueError(f"Unexpected error: {str(e)}")
     
     def search_issues(self, jql: str, fields: Optional[List[str]] = None, 
                      max_results: int = 50, start_at: int = 0) -> Dict:
         """
-        Search for issues using JQL (Jira Query Language).
+        Search for issues using JQL.
         
         Args:
             jql: JQL query string
-            fields: List of fields to return (default: all)
+            fields: List of fields to retrieve
             max_results: Maximum number of results to return
-            start_at: Index to start from for pagination
+            start_at: Start index of results
             
         Returns:
-            Response containing matched issues
+            Search results
         """
-        endpoint = "/rest/api/2/search"
+        endpoint = "/rest/api/3/search"
         
-        # Build the request body
-        data = {
+        # Create params
+        params = {
             "jql": jql,
-            "startAt": start_at,
-            "maxResults": max_results
+            "maxResults": max_results,
+            "startAt": start_at
         }
         
         # Add fields if specified
         if fields:
-            data["fields"] = fields
+            params["fields"] = ",".join(fields)
         
-        return self._make_request("POST", endpoint, data=data)
+        return self._make_request("GET", endpoint, params=params)
     
     def get_issue(self, issue_key: str, fields: Optional[List[str]] = None) -> Dict:
         """
-        Get details for a specific issue.
+        Get issue by key.
         
         Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
-            fields: List of fields to return (default: all)
+            issue_key: Issue key (e.g. PROJECT-123)
+            fields: List of fields to retrieve
             
         Returns:
-            Issue details
+            Issue data
         """
-        endpoint = f"/rest/api/2/issue/{issue_key}"
+        endpoint = f"/rest/api/3/issue/{issue_key}"
         
-        # Add fields as parameters if specified
+        # Create params
         params = {}
         if fields:
             params["fields"] = ",".join(fields)
         
         return self._make_request("GET", endpoint, params=params)
     
-    def create_issue(self, project_key: str = None, issue_type: str = "Task", summary: str = None, 
-                    description: Optional[str] = None, 
-                    additional_fields: Optional[Dict] = None) -> Dict:
+    def create_issue(self, project_key: str, summary: str, issue_type: str = "Task",
+                 description: str = "", additional_fields: Dict = None) -> Dict:
         """
-        Create a new issue in Jira.
+        Create a new issue.
         
         Args:
-            project_key: Project key (e.g., 'PROJECT'). If not provided, uses DEFAULT_JIRA_PROJECT_KEY from settings.
-            issue_type: Issue type (e.g., 'Task', 'Bug'). Default is 'Task'.
-            summary: Issue summary/title
+            project_key: Project key (e.g. PROJECT)
+            summary: Issue summary
+            issue_type: Issue type (e.g. Task, Bug, etc.)
             description: Issue description
-            additional_fields: Additional fields to set on the issue
+            additional_fields: Additional fields to set
             
         Returns:
-            Created issue details
+            Created issue data
         """
-        endpoint = "/rest/api/2/issue"
-        
-        # Use default project key if not provided
-        if not project_key:
-            project_key = settings.DEFAULT_JIRA_PROJECT_KEY
-            logger.info(f"Using default project key: {project_key}")
-        
-        # Build the issue data
-        data = {
-            "fields": {
+        # Set up base fields
+        fields = {
                 "project": {
                     "key": project_key
                 },
+            "summary": summary,
                 "issuetype": {
                     "name": issue_type
-                },
-                "summary": summary
             }
         }
         
-        # Add description if provided
+        # Add description if provided - format as Atlassian Document Format (ADF) for API v3
         if description:
-            data["fields"]["description"] = description
-        
-        # Add any additional fields
-        if additional_fields:
-            data["fields"].update(additional_fields)
-        
-        return self._make_request("POST", endpoint, data=data)
-    
-    def update_issue(self, issue_key: str, fields: Dict) -> Dict:
-        """
-        Update an existing issue in Jira.
-        
-        Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
-            fields: Fields to update
+            # Create a simple ADF document
+            fields["description"] = {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": description
+                            }
+                        ]
+                    }
+                ]
+            }
             
-        Returns:
-            Empty dict if successful
-        """
-        endpoint = f"/rest/api/2/issue/{issue_key}"
+        # Add additional fields
+        if additional_fields:
+            for key, value in additional_fields.items():
+                # Handle common fields
+                if key == "priority":
+                    # Handle priority as string or object
+                    if isinstance(value, str):
+                        fields["priority"] = {"name": value}
+                    else:
+                        fields["priority"] = value
+                elif key == "labels":
+                    # Handle labels as list or string
+                    if isinstance(value, str):
+                        fields["labels"] = [v.strip() for v in value.split(",")]
+                    else:
+                        fields["labels"] = value
+                elif key == "assignee":
+                    # Handle assignee as string or object
+                    if isinstance(value, str):
+                        fields["assignee"] = {"name": value}
+                    else:
+                        fields["assignee"] = value
+                elif key == "due_date":
+                    # Handle due date - correct field name for Jira API is 'duedate'
+                    fields["duedate"] = value
+                else:
+                    # Add field directly
+                    fields[key] = value
         
-        # Build the update data
+        # Create request data
         data = {
             "fields": fields
         }
         
+        # Make request
+        return self._make_request(
+            "POST", 
+            endpoint="/rest/api/3/issue",
+            data=data
+        )
+    
+    def update_issue(self, issue_key: str, fields: Dict) -> Dict:
+        """
+        Update an existing issue.
+        
+        Args:
+            issue_key: Issue key (e.g. PROJECT-123)
+            fields: Fields to update
+            
+        Returns:
+            Response from the API
+        """
+        endpoint = f"/rest/api/3/issue/{issue_key}"
+        
+        # Create request data
+        data = {
+            "fields": fields
+        }
+        
+        # Make request
         return self._make_request("PUT", endpoint, data=data)
     
     def add_comment(self, issue_key: str, comment: str, visibility: Optional[Dict] = None) -> Dict:
@@ -444,24 +530,25 @@ class JiraClient:
         Add a comment to an issue.
         
         Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
-            comment: The comment text
-            visibility: Optional dict defining comment visibility (e.g., {"type": "role", "value": "Administrators"})
+            issue_key: Issue key (e.g. PROJECT-123)
+            comment: Comment text
+            visibility: Visibility restrictions (e.g. {"type": "role", "value": "Administrators"})
             
         Returns:
-            Created comment details
+            Response from the API
         """
-        endpoint = f"/rest/api/2/issue/{issue_key}/comment"
+        endpoint = f"/rest/api/3/issue/{issue_key}/comment"
         
-        # Build the comment data
+        # Create comment data
         data = {
             "body": comment
         }
         
-        # Add visibility if provided
+        # Add visibility if specified
         if visibility:
             data["visibility"] = visibility
         
+        # Make request
         return self._make_request("POST", endpoint, data=data)
     
     def get_issue_transitions(self, issue_key: str) -> Dict:
@@ -469,12 +556,12 @@ class JiraClient:
         Get available transitions for an issue.
         
         Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
+            issue_key: Issue key (e.g. PROJECT-123)
             
         Returns:
-            List of available transitions
+            Available transitions
         """
-        endpoint = f"/rest/api/2/issue/{issue_key}/transitions"
+        endpoint = f"/rest/api/3/issue/{issue_key}/transitions"
         
         return self._make_request("GET", endpoint)
     
@@ -485,17 +572,17 @@ class JiraClient:
         Transition an issue to a new status.
         
         Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
-            transition_id: ID of the transition to perform
-            comment: Optional comment to add with the transition
-            fields: Optional fields to update during the transition
+            issue_key: Issue key (e.g. PROJECT-123)
+            transition_id: Transition ID
+            comment: Comment to add
+            fields: Fields to update during transition
             
         Returns:
-            Empty dict if successful
+            Response from the API
         """
-        endpoint = f"/rest/api/2/issue/{issue_key}/transitions"
+        endpoint = f"/rest/api/3/issue/{issue_key}/transitions"
         
-        # Build the transition data
+        # Create transition data
         data = {
             "transition": {
                 "id": transition_id
@@ -518,6 +605,7 @@ class JiraClient:
         if fields:
             data["fields"] = fields
         
+        # Make request
         return self._make_request("POST", endpoint, data=data)
     
     def get_projects(self) -> List[Dict]:
@@ -527,21 +615,21 @@ class JiraClient:
         Returns:
             List of projects
         """
-        endpoint = "/rest/api/2/project"
+        endpoint = "/rest/api/3/project"
         
         return self._make_request("GET", endpoint)
     
     def get_project(self, project_key: str) -> Dict:
         """
-        Get details for a specific project.
+        Get a specific project.
         
         Args:
-            project_key: The project key (e.g., 'PROJECT')
+            project_key: Project key (e.g. PROJECT)
             
         Returns:
-            Project details
+            Project data
         """
-        endpoint = f"/rest/api/2/project/{project_key}"
+        endpoint = f"/rest/api/3/project/{project_key}"
         
         return self._make_request("GET", endpoint)
     
@@ -552,7 +640,7 @@ class JiraClient:
         Returns:
             List of issue types
         """
-        endpoint = "/rest/api/2/issuetype"
+        endpoint = "/rest/api/3/issuetype"
         
         return self._make_request("GET", endpoint)
     
@@ -561,32 +649,33 @@ class JiraClient:
         Assign an issue to a user.
         
         Args:
-            issue_key: The issue key (e.g., 'PROJECT-123')
-            assignee: Username to assign to, or None to unassign
+            issue_key: Issue key (e.g. PROJECT-123)
+            assignee: Username of the assignee, or None to unassign
             
         Returns:
-            Empty dict if successful
+            Response from the API
         """
-        endpoint = f"/rest/api/2/issue/{issue_key}/assignee"
+        endpoint = f"/rest/api/3/issue/{issue_key}/assignee"
         
-        # Build the assignee data
-        data = {
-            "name": assignee
-        }
+        # Create assignee data
+        data = {}
+        if assignee:
+            data["name"] = assignee
         
+        # Make request
         return self._make_request("PUT", endpoint, data=data)
     
     def get_user(self, username: str) -> Dict:
         """
-        Get details for a specific user.
+        Get user information.
         
         Args:
-            username: The username
+            username: Username
             
         Returns:
-            User details
+            User data
         """
-        endpoint = f"/rest/api/2/user"
+        endpoint = f"/rest/api/3/user"
         params = {"username": username}
         
         return self._make_request("GET", endpoint, params=params)
@@ -602,9 +691,9 @@ class JiraClient:
         Returns:
             List of matched users
         """
-        endpoint = f"/rest/api/2/user/search"
+        endpoint = f"/rest/api/3/user/search"
         params = {
-            "username": query,
+            "query": query,
             "maxResults": max_results
         }
         
@@ -923,9 +1012,10 @@ class JiraClient:
         Get information about the authenticated user.
         
         Returns:
-            User information
+            User data from Jira
         """
-        endpoint = "/rest/api/2/myself"
+        endpoint = "/rest/api/3/myself"
+        
         return self._make_request("GET", endpoint)
     
     def generate_token_hash(self, token: str) -> str:
@@ -973,4 +1063,264 @@ class JiraClient:
             
         except Exception as e:
             logger.error(f"Error loading OAuth token: {str(e)}")
-            return False 
+            return False
+    
+    def sync_users(self, db: Session) -> Dict[str, Any]:
+        """
+        Sync users from Jira to local database. Uses different methods based on Jira server
+        version to accommodate GDPR mode and other limitations.
+        
+        Args:
+            db: Database session
+            
+        Returns:
+            Dictionary with results of sync operation
+        """
+        try:
+            users = []
+            
+            # Try first with /rest/api/3/users/search endpoint (Cloud)
+            try:
+                # Try using the newer search endpoint with query parameter
+                cloud_users = self._make_request(
+                    "GET", 
+                    "/rest/api/3/user/search", 
+                    params={"query": "", "maxResults": 1000}
+                )
+                
+                if isinstance(cloud_users, list):
+                    users.extend(cloud_users)
+                    logger.info(f"Found {len(cloud_users)} users using cloud search endpoint")
+            except Exception as e:
+                logger.warning(f"Failed to get users with cloud search endpoint: {str(e)}")
+                
+                # If the first method fails, try the older endpoint
+                try:
+                    # Some Jira instances need to use the older /user endpoint
+                    standard_users = self._make_request(
+                        "GET", 
+                        "/rest/api/3/user", 
+                        params={"username": "", "maxResults": 1000}
+                    )
+                    
+                    if isinstance(standard_users, list):
+                        users.extend(standard_users)
+                        logger.info(f"Found {len(standard_users)} users using standard user endpoint")
+                except Exception as e2:
+                    logger.warning(f"Failed to get users with standard user endpoint: {str(e2)}")
+            
+            # If both previous methods failed, try getting users from groups
+            if not users:
+                try:
+                    # Get admin groups first
+                    admin_groups = self._make_request(
+                        "GET", 
+                        "/rest/api/3/groups", 
+                        params={"maxResults": 100}
+                    )
+                    
+                    # Get users from each group
+                    for group in admin_groups.get("groups", []):
+                        try:
+                            group_users = self._make_request(
+                                "GET", 
+                                f"/rest/api/3/group/member", 
+                                params={"groupname": group["name"], "maxResults": 1000}
+                            )
+                            
+                            if "values" in group_users:
+                                users.extend(group_users["values"])
+                                logger.info(f"Found {len(group_users['values'])} users in group {group['name']}")
+                        except Exception as group_err:
+                            logger.warning(f"Failed to get users from group {group['name']}: {str(group_err)}")
+                except Exception as group_list_err:
+                    logger.warning(f"Failed to get groups: {str(group_list_err)}")
+            
+            # Last resort - try to get user details from project leads
+            if not users:
+                try:
+                    projects = self._make_request("GET", "/rest/api/3/project")
+                    
+                    for project in projects:
+                        if "lead" in project and project["lead"] not in users:
+                            users.append(project["lead"])
+                            logger.info(f"Added user from project lead: {project['lead'].get('displayName', 'Unknown')}")
+                except Exception as project_err:
+                    logger.warning(f"Failed to get project leads: {str(project_err)}")
+            
+            # Remove duplicates based on accountId or name
+            unique_users = []
+            unique_ids = set()
+            
+            for user in users:
+                user_id = user.get("accountId") or user.get("name")
+                if user_id and user_id not in unique_ids:
+                    unique_ids.add(user_id)
+                    unique_users.append(user)
+            
+            # Update user cache in database
+            updated_count = bulk_update_jira_users(db, unique_users)
+            
+            return {
+                "success": True,
+                "total_users": len(unique_users),
+                "updated_users": updated_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Error syncing users: {str(e)}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+# Standalone function for creating Jira issues (used by API endpoints)
+def create_jira_issue(entities: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a Jira issue based on extracted entities.
+    
+    Args:
+        entities: Dictionary of entities extracted from user input
+        
+    Returns:
+        Response from Jira API or error dict
+    """
+    try:
+        # Create a client instance - attempt to use OAuth if user_id is in the entities
+        user_id = entities.get("user_id")
+        use_oauth = bool(user_id)
+        
+        # Create client with OAuth if possible
+        client = JiraClient(use_oauth=use_oauth, user_id=user_id)
+        
+        # Log authentication method
+        if use_oauth:
+            logger.info(f"Creating Jira issue with OAuth authentication for user {user_id}")
+            # Try to load OAuth token from database
+            db = next(get_db())
+            token_loaded = client.load_oauth_token(db)
+            
+            if not token_loaded:
+                logger.warning(f"Failed to load OAuth token for user {user_id}, falling back to basic auth")
+                # Force fallback to basic auth - don't use the client's default token
+                client = JiraClient(use_oauth=False)
+        else:
+            logger.info("Creating Jira issue with basic authentication")
+        
+        # Extract required fields with defaults
+        project_key = entities.get("project_key")
+        if not project_key:
+            # Use default project if not specified
+            project_key = settings.DEFAULT_JIRA_PROJECT_KEY
+            if not project_key:
+                return {"error": "Project key is required but not provided"}
+        
+        # Handle either summary or title
+        summary = entities.get("summary", entities.get("title", ""))
+        if not summary:
+            return {"error": "Summary or title is required"}
+        
+        # Get description
+        description = entities.get("description", "")
+        
+        # Get issue type
+        issue_type = entities.get("issue_type", "Task")
+        
+        # Validate assignee if provided
+        if entities.get("assignee"):
+            assignee = entities.get("assignee")
+            db = next(get_db())
+            
+            # First, try to find user in our local cache
+            cached_user = get_jira_user_by_name(db, assignee)
+            
+            if cached_user:
+                # We found the user in our local cache, use the username from there
+                logger.info(f"Found cached user for assignee '{assignee}': {cached_user.username}")
+                entities["assignee"] = cached_user.username
+            else:
+                # We need to validate the assignee against Jira
+                # Check if we're in GDPR mode - if so, we may not be able to search for users
+                try:
+                    # Try to search for the user in Jira
+                    # First try query parameter (Cloud)
+                    users = client._make_request(
+                        "GET", 
+                        "/rest/api/3/user/search", 
+                        params={"query": assignee, "maxResults": 10}
+                    )
+                    
+                    valid_user = False
+                    
+                    if users and isinstance(users, list):
+                        # Check if any of the returned users match
+                        for user in users:
+                            if user.get("displayName", "").lower() == assignee.lower() or \
+                               user.get("name", "").lower() == assignee.lower() or \
+                               user.get("emailAddress", "").lower() == assignee.lower():
+                                # Update entities with correct user format
+                                entities["assignee"] = user.get("name")
+                                logger.info(f"Found Jira user for assignee '{assignee}': {user.get('name')}")
+                                valid_user = True
+                                
+                                # Also cache this user for future lookups
+                                update_jira_user_cache(db, user)
+                                break
+                    
+                    if not valid_user:
+                        # Sync users and try again
+                        client.sync_users(db)
+                        
+                        # Try one more time with the local cache
+                        cached_user = get_jira_user_by_name(db, assignee)
+                        if cached_user:
+                            entities["assignee"] = cached_user.username
+                            logger.info(f"Found user in refreshed cache: {cached_user.username}")
+                        else:
+                            logger.warning(f"Assignee '{assignee}' not found in Jira, may cause creation to fail")
+                            
+                except Exception as e:
+                    # If we can't validate the assignee, log it but continue - Jira will validate on creation
+                    logger.warning(f"Failed to validate assignee '{assignee}': {str(e)}")
+        
+        # Prepare additional fields
+        additional_fields = {}
+        for key, value in entities.items():
+            # Skip already processed fields
+            if key in ["project_key", "summary", "title", "description", "issue_type", "original_query", "user_id"]:
+                continue
+                
+            # Skip empty values
+            if value is None or value == "":
+                continue
+                
+            # Add to additional fields
+            additional_fields[key] = value
+            
+        # Call the Jira API client
+        logger.info(f"Creating Jira issue with project_key={project_key}, summary={summary}, issue_type={issue_type}")
+        result = client.create_issue(
+            project_key=project_key,
+            summary=summary,
+            issue_type=issue_type,
+            description=description,
+            additional_fields=additional_fields
+        )
+        
+        # Format response to include all important information
+        if "key" in result:
+            return {
+                "success": True,
+                "key": result["key"],
+                "id": result.get("id"),
+                "self": result.get("self"),
+                "summary": summary,
+                "project_key": project_key,
+                "issue_type": issue_type,
+                "assignee": entities.get("assignee")
+            }
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error in create_jira_issue: {str(e)}", exc_info=True)
+        return {"error": str(e)} 

@@ -4,17 +4,19 @@ import logging
 import json
 import os
 from datetime import datetime, timedelta
+import dateparser
 from app.services.memory import memory_service
-from app.models.database import get_db, create_reminder, get_pending_reminders, JiraCache, Reminder, UserConfig
+from app.models.database import get_db, create_reminder, get_pending_reminders, JiraCache, Reminder, UserConfig, JiraUserCache
 from app.models.schemas import ReminderRequest, ReminderResponse, ReminderList, ChatMessage, ChatResponse, ReminderModel, ReminderActionResponse
 from app.services.llm import llm_service
 from app.services.prompts import prompt_manager
-from app.services.jira import JiraClient
+from app.services.jira import JiraClient, create_jira_issue
 from app.core.config import settings
 from sqlalchemy.orm import Session
 import hashlib
 from app.api.auth import get_current_user
 import re
+from sqlalchemy import or_, func
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -64,6 +66,22 @@ async def health_check():
         "status": "ok",
         "version": settings.API_VERSION,
         "server": "Jira Action Items Chatbot API"
+    }
+
+@router.get("/settings")
+async def get_settings():
+    """
+    Get server settings that the client needs to know about.
+    
+    Returns:
+        Dictionary of settings for the client
+    """
+    return {
+        "settings": {
+            "DEFAULT_JIRA_PROJECT_KEY": settings.DEFAULT_JIRA_PROJECT_KEY,
+            "API_VERSION": settings.API_VERSION,
+            "JIRA_URL": settings.JIRA_URL
+        }
     }
 
 @router.get("/")
@@ -156,26 +174,60 @@ async def create_jira_task(
         task: Task details including project, type, summary, etc.
     """
     try:
+        # Log the incoming request
+        logger.info(f"Creating Jira task with data: {json.dumps(task, default=str)}")
+        
+        # Check for user_id in the task data for OAuth authentication
+        user_id = task.get("user_id")
+        
         # Get Jira client with OAuth if available
         client = get_jira_client(request, db)
         
         # Extract required fields
         project_key = task.get("project_key")
         if not project_key:
-            raise HTTPException(status_code=400, detail="Project key is required")
+            project_key = settings.DEFAULT_JIRA_PROJECT_KEY
+            if not project_key:
+                raise HTTPException(status_code=400, detail="Project key is required")
+            logger.info(f"Using default project key: {project_key}")
         
         issue_type = task.get("issue_type", "Task")
+        
+        # Handle the summary/title field (accept either)
         summary = task.get("summary")
         if not summary:
-            raise HTTPException(status_code=400, detail="Summary is required")
+            summary = task.get("title")
+        if not summary:
+            raise HTTPException(status_code=400, detail="Summary or title is required")
         
         description = task.get("description", "")
         
         # Extract additional fields
         additional_fields = {}
+        field_mapping = {
+            "priority": "priority",
+            "assignee": "assignee",
+            "labels": "labels",
+            "components": "components",
+            "due_date": "duedate",  # Map due_date to duedate which Jira expects
+            "duedate": "duedate",   # Allow direct duedate field too
+            "fixVersions": "fixVersions",
+            "versions": "versions"
+        }
+        
         for key, value in task.items():
-            if key not in ["project_key", "issue_type", "summary", "description"]:
-                additional_fields[key] = value
+            # Skip already handled fields and null/empty values
+            if key in ["project_key", "issue_type", "summary", "title", "description", "user_id"] or value is None or value == "":
+                continue
+            
+            # Map field name if needed
+            mapped_key = field_mapping.get(key, key)
+            additional_fields[mapped_key] = value
+            
+        # Log what we're about to send to Jira
+        logger.info(f"Creating Jira issue in project {project_key} with type {issue_type}")
+        logger.debug(f"Summary: {summary}")
+        logger.debug(f"Additional fields: {json.dumps(additional_fields, default=str)}")
         
         # Create the issue
         result = client.create_issue(
@@ -186,10 +238,25 @@ async def create_jira_task(
             additional_fields=additional_fields
         )
         
-        return result
+        # Log success and return the result
+        logger.info(f"Successfully created Jira issue: {result.get('key', 'Unknown key')}")
+        return {"success": True, "data": result}
+    except HTTPException as he:
+        # Re-raise HTTP exceptions
+        logger.error(f"HTTP error creating Jira task: {str(he.detail)}")
+        raise
     except Exception as e:
-        logger.error(f"Error creating Jira task: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create Jira task: {str(e)}")
+        # Handle other exceptions
+        error_message = str(e)
+        logger.error(f"Error creating Jira task: {error_message}")
+        logger.error("Error stack trace:", exc_info=True)
+        
+        # Return a structured error response
+        return {
+            "success": False,
+            "error": error_message,
+            "message": "Failed to create Jira task"
+        }
 
 @router.get("/jira/tasks/{issue_key}")
 async def get_jira_task(
@@ -428,46 +495,52 @@ async def extract_jira_entities(
 @router.post("/chat", response_model=ChatResponse)
 async def process_chat_message(message: ChatMessage, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
-    Process a chat message from the extension, using LLM to generate a response.
+    Process a user chat message using LLM service and return response.
+    
+    Args:
+        message: Chat message with user's text
+        db: Database session
+        
+    Returns:
+        Chat response with LLM's reply
     """
+    # Track execution time
+    start_time = datetime.now()
+    
     try:
-        start_time = datetime.now()
+        # Get user input
+        sanitized_text = message.text.strip()
         
-        # Sanitize input text to prevent processing errors
-        if not message.text or not isinstance(message.text, str):
-            logger.warning("Received empty or invalid message text")
-            return ChatResponse(
-                response="I couldn't understand your message. Please try again with a clear question or request.",
-                timestamp=datetime.now()
-            )
-        
-        # Truncate extremely long messages and remove invalid characters
-        sanitized_text = message.text[:1000]  # Limit to 1000 chars
-        sanitized_text = re.sub(r'[^\w\s.,;:!?\'"-=+*/\\@#$%^&(){}\[\]<>|]', '', sanitized_text).strip()
-        
+        # Skip empty messages
         if not sanitized_text:
-            logger.warning(f"Message contained only invalid characters: {message.text[:50]}...")
             return ChatResponse(
-                response="Your message contained only special characters I couldn't process. Please try again with a normal text query.",
+                response="I didn't receive any message. Please try again.",
                 timestamp=datetime.now()
             )
+            
+        # Get optional conversation history safely using getattr with default
+        history = getattr(message, 'history', [])
         
-        logger.info(f"Processing chat message: {sanitized_text[:50]}...")
-        
-        # Process the user's message to determine intent and extract entities
+        # Process user input to determine intent and extract entities
         try:
-            processed = prompt_manager.process_user_input(sanitized_text)
-            intent = processed["intent"]
-            entities = processed["entities"]
-            messages = processed["messages"]
+            from app.services.prompts import PromptManager
+            intent_result = PromptManager.process_user_input(sanitized_text)
+            
+            intent = intent_result.get("intent", "general_chat")
+            entities = intent_result.get("entities", {})
+            messages = intent_result.get("messages", [])
             
             logger.info(f"Detected intent: {intent} from message: {sanitized_text[:50]}...")
-        except Exception as e:
-            logger.error(f"Error processing intent: {str(e)}")
-            return ChatResponse(
-                response="I had trouble understanding your request. Could you please rephrase it?",
-                timestamp=datetime.now()
-            )
+            logger.debug(f"Extracted entities: {entities}")
+        except Exception as intent_error:
+            logger.error(f"Error processing intent: {str(intent_error)}")
+            # Default to general chat on error
+            intent = "general_chat"
+            entities = {}
+            messages = []
+            
+        # Action storage
+        actions = []
         
         # Try to retrieve user preferences from memory
         try:
@@ -557,7 +630,93 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
                             "content": f"Jira tasks: {json.dumps(jira_context, default=str)}"
                         }
                         messages.insert(2, jira_message)
+                
+                elif intent == "create_task":
+                    # Handle intent-specific actions
+                    actions = []
+                    try:
+                        # Basic validation check
+                        if not entities.get("summary") and not entities.get("title"):
+                            raise ValueError("Task summary or title is required")
                         
+                        # Normalize title/summary fields
+                        if entities.get("title") and not entities.get("summary"):
+                            entities["summary"] = entities["title"]
+                        elif entities.get("summary") and not entities.get("title"):
+                            entities["title"] = entities["summary"]
+                            
+                        # Convert day name to date if needed
+                        if entities.get("due_date"):
+                            try:
+                                parsed_date = parse_due_date(entities["due_date"])
+                                if parsed_date:
+                                    logger.debug(f"Converted day name '{entities['due_date']}' to date '{parsed_date}'")
+                                    entities["due_date"] = parsed_date
+                            except Exception as date_err:
+                                logger.warning(f"Error parsing due date: {str(date_err)}")
+                        
+                        logger.info(f"Creating Jira issue with data: {json.dumps(entities)}")
+                        
+                        # Create Jira issue
+                        response = create_jira_issue(entities)
+                        
+                        if response and response.get("key"):
+                            # Success - add success message and action
+                            issue_key = response.get("key")
+                            issue_id = response.get("id")
+                            
+                            # Create action for viewing the issue
+                            actions.append({
+                                "action": "view_task",
+                                "text": f"View {issue_key}",
+                                "url": f"{os.getenv('JIRA_URL', 'https://your-domain.atlassian.net')}/browse/{issue_key}"
+                            })
+                            
+                            # Add to response
+                            summary = response.get("summary", entities.get("summary", entities.get("title", "")))
+                            assignee_info = ""
+                            if response.get("assignee") or entities.get("assignee"):
+                                assignee = response.get("assignee") or entities.get("assignee")
+                                assignee_info = f" and assigned to {assignee}"
+                            
+                            response_text = f"✅ I've created Jira task {issue_key}{assignee_info}: {summary}. You can click the button below to view it."
+                            
+                            # Store in memory if possible
+                            try:
+                                await memory_service.add_observations([
+                                    {
+                                        "entityName": f"jira_issue_{issue_key}",
+                                        "contents": [
+                                            f"Created task {issue_key} with summary: {summary}",
+                                            f"Issue type: {response.get('issue_type', entities.get('issue_type', 'Task'))}",
+                                            f"Created at: {datetime.now().isoformat()}"
+                                        ]
+                                    }
+                                ])
+                            except Exception as memory_err:
+                                logger.warning(f"Error adding task to memory: {str(memory_err)}")
+                        else:
+                            # Failed
+                            error_message = response.get("error", "Unknown error")
+                            response_text = f"❌ I had difficulty creating your Jira task: {error_message}"
+                            
+                            # Add retry action
+                            actions.append({
+                                "action": "create_task",
+                                "text": "Try Again",
+                                "params": entities
+                            })
+                    except Exception as create_err:
+                        logger.error(f"Error creating Jira task: {str(create_err)}", exc_info=True)
+                        response_text = f"❌ I encountered an error while creating your task: {str(create_err)}"
+                        
+                        # Add retry action
+                        actions.append({
+                            "action": "create_task",
+                            "text": "Try Again",
+                            "params": entities
+                        })
+                
                 # Add similar logic for other Jira intents...
                 
             except Exception as e:
@@ -689,13 +848,40 @@ async def process_chat_message(message: ChatMessage, db: Session = Depends(get_d
             )
     
     except Exception as e:
-        logger.error(f"Error processing chat message: {str(e)}")
-        # Provide a user-friendly error message
-        error_message = "I'm sorry, but I encountered an error processing your request. Please try again with a different phrasing."
-        return ChatResponse(
-            response=error_message,
-            timestamp=datetime.now()
-        )
+        error_message = str(e)
+        logger.error(f"Error processing chat message: {error_message}")
+        logger.error(f"Error stack trace:", exc_info=True)
+        
+        try:
+            # Try to extract useful information from the error message
+            if "JSONDecodeError" in error_message:
+                error_message = "Failed to parse JSON response from LLM. This may be due to an issue with the service."
+            elif "timeout" in error_message.lower():
+                error_message = "Request timed out. Please try again."
+            elif "connection" in error_message.lower():
+                error_message = "Connection error. Please check your internet connection and try again."
+            elif "authentication" in error_message.lower() or "unauthorized" in error_message.lower() or "401" in error_message:
+                error_message = "Authentication error. Please check your credentials."
+            elif "permission" in error_message.lower() or "forbidden" in error_message.lower() or "403" in error_message:
+                error_message = "Permission denied. You don't have access to this resource."
+            elif "not found" in error_message.lower() or "404" in error_message:
+                error_message = "Resource not found. Please check your request."
+            
+            # Prepare a friendly response
+            friendly_response = f"I'm sorry, I encountered an error processing your request. {error_message}"
+            
+            # Return a friendly error message
+            return ChatResponse(
+                response=friendly_response,
+                timestamp=datetime.now()
+            )
+        except Exception as response_error:
+            # Last resort fallback
+            logger.error(f"Error creating error response: {str(response_error)}")
+            return ChatResponse(
+                response="I'm sorry, I encountered an unexpected error. Please try again later.",
+                timestamp=datetime.now()
+            )
 
 # Memory Management Endpoints
 
@@ -1032,7 +1218,7 @@ async def get_pending_reminders_api(db: Session = Depends(get_db)) -> Dict[str, 
         return {"reminders": result, "count": len(result)}
     except Exception as e:
         logger.error(f"Error fetching pending reminders: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch pending reminders: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to fetch pending reminders: {str(e)}")
 
 # Add a user info endpoint for frontend compatibility
 @router.get("/user")
@@ -1076,4 +1262,123 @@ async def get_user_info(
         return {
             "authenticated": False,
             "error": str(e)
-        } 
+        }
+
+# Helper function to parse due dates from various formats
+def parse_due_date(date_str: str) -> str:
+    """
+    Parse a due date string into Jira-compatible format (YYYY-MM-DD).
+    
+    Args:
+        date_str: Date string in various formats (e.g., 'tomorrow', 'next Monday', 'Friday', '2023-05-15')
+        
+    Returns:
+        Formatted date string (YYYY-MM-DD) or original string if parsing fails
+    """
+    try:
+        # Try to parse the date string using dateparser
+        parsed_date = dateparser.parse(
+            date_str, 
+            settings={'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'YMD'}
+        )
+        
+        if parsed_date:
+            # Format as YYYY-MM-DD for Jira
+            return parsed_date.strftime('%Y-%m-%d')
+        
+        # Return original string if parsing fails
+        return date_str
+    except Exception as e:
+        logger.warning(f"Error parsing due date '{date_str}': {str(e)}")
+        return date_str 
+
+# Add this new endpoint to sync Jira users and retrieve cached users
+
+@router.post("/jira/sync-users")
+async def sync_jira_users(
+    request: Request,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Sync Jira users to local database.
+    
+    Returns:
+        Dictionary with results of sync operation
+    """
+    try:
+        # Get Jira client
+        client = JiraClient()
+        
+        # Sync users
+        result = client.sync_users(db)
+        
+        # Return result
+        return result
+    except Exception as e:
+        logger.error(f"Error syncing Jira users: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error syncing Jira users: {str(e)}"
+        )
+
+@router.get("/jira/users")
+async def get_jira_users(
+    query: str = None,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Get Jira users from local database.
+    
+    Args:
+        query: Optional search query to filter users
+        limit: Maximum number of users to return
+        
+    Returns:
+        Dictionary with list of users
+    """
+    try:
+        from app.models.database import JiraUserCache
+        
+        # Build query
+        db_query = db.query(JiraUserCache)
+        
+        # Apply search filter if provided
+        if query:
+            query_lower = query.lower()
+            db_query = db_query.filter(
+                or_(
+                    func.lower(JiraUserCache.username).contains(query_lower),
+                    func.lower(JiraUserCache.display_name).contains(query_lower),
+                    func.lower(JiraUserCache.email).contains(query_lower)
+                )
+            )
+        
+        # Order by display name and limit results
+        users = db_query.order_by(JiraUserCache.display_name).limit(limit).all()
+        
+        # Format response
+        result = []
+        for user in users:
+            result.append({
+                "id": user.id,
+                "account_id": user.account_id,
+                "username": user.username,
+                "display_name": user.display_name,
+                "email": user.email,
+                "avatar_url": user.avatar_url,
+                "active": user.active,
+                "last_updated": user.last_updated.isoformat() if user.last_updated else None
+            })
+        
+        return {
+            "success": True,
+            "count": len(result),
+            "users": result
+        }
+    except Exception as e:
+        logger.error(f"Error getting Jira users: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting Jira users: {str(e)}"
+        ) 
