@@ -41,6 +41,9 @@ chrome.runtime.onInstalled.addListener(function () {
 
   // Start reminder checks
   startReminderChecks();
+
+  // Load server settings
+  loadServerSettings();
 });
 
 // Listen for messages from content scripts or popup
@@ -633,7 +636,7 @@ function _initiateLogin() {
           return getServerUrl();
         case 5:
           serverUrl = _context7.sent;
-          loginUrl = "".concat(serverUrl, "/api/auth/login"); // Open a new tab with the login URL
+          loginUrl = "".concat(serverUrl, "/auth/login"); // Open a new tab with the login URL
           chrome.tabs.create({
             url: loginUrl
           });
@@ -667,7 +670,7 @@ function _logout() {
           return getServerUrl();
         case 3:
           serverUrl = _context8.sent;
-          logoutUrl = "".concat(serverUrl, "/api/auth/logout"); // Call the logout API
+          logoutUrl = "".concat(serverUrl, "/auth/logout"); // Call the logout API
           _context8.next = 7;
           return fetch(logoutUrl, {
             method: 'GET',
@@ -708,7 +711,7 @@ function _checkAuthStatus() {
           return getServerUrl();
         case 3:
           serverUrl = _context9.sent;
-          statusUrl = "".concat(serverUrl, "/api/auth/status"); // Call the status API
+          statusUrl = "".concat(serverUrl, "/auth/status"); // Call the status API
           _context9.next = 7;
           return fetch(statusUrl, {
             method: 'GET',
@@ -765,7 +768,7 @@ function _refreshAuth() {
           return getServerUrl();
         case 3:
           serverUrl = _context0.sent;
-          refreshUrl = "".concat(serverUrl, "/api/auth/refresh-token"); // Call the refresh token API
+          refreshUrl = "".concat(serverUrl, "/auth/refresh-token"); // Call the refresh token API
           _context0.next = 7;
           return fetch(refreshUrl, {
             method: 'POST',
@@ -800,6 +803,44 @@ function _refreshAuth() {
 checkAuthStatus().then(function (status) {
   console.log('Initial auth status:', status.authenticated ? 'Authenticated' : 'Not authenticated');
 });
+
+// Load settings from the server
+function loadServerSettings() {
+  return _loadServerSettings.apply(this, arguments);
+}
+function _loadServerSettings() {
+  _loadServerSettings = _asyncToGenerator(/*#__PURE__*/_regeneratorRuntime().mark(function _callee1() {
+    var response;
+    return _regeneratorRuntime().wrap(function _callee1$(_context1) {
+      while (1) switch (_context1.prev = _context1.next) {
+        case 0:
+          _context1.prev = 0;
+          console.log('Loading server settings...');
+          _context1.next = 4;
+          return handleApiRequest('/api/settings');
+        case 4:
+          response = _context1.sent;
+          if (response && response.settings) {
+            // Store settings in local storage
+            chrome.storage.local.set({
+              serverSettings: response.settings
+            });
+            console.log('Server settings loaded:', response.settings);
+          }
+          _context1.next = 11;
+          break;
+        case 8:
+          _context1.prev = 8;
+          _context1.t0 = _context1["catch"](0);
+          console.error('Failed to load server settings:', _context1.t0);
+        case 11:
+        case "end":
+          return _context1.stop();
+      }
+    }, _callee1, null, [[0, 8]]);
+  }));
+  return _loadServerSettings.apply(this, arguments);
+}
 /******/ })()
 ;
 //# sourceMappingURL=background.js.map
